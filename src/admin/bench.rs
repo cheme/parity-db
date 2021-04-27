@@ -14,21 +14,26 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
+use structopt::StructOpt;
+use super::*;
+
+/// Stress subcommand.
+
 #[cfg_attr(any(target_os = "linux", target_os = "macos"),  global_allocator)]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
-struct BenchAdapter(parity_db::Db);
+pub(super) struct BenchAdapter(crate::Db);
 
 impl db_bench::Db for BenchAdapter {
-	type Options = ();
+	type Options = crate::options::Options;
 
 	fn open(path: &std::path::Path) -> Self {
-		BenchAdapter(parity_db::Db::with_columns(path, 1).unwrap())
+		BenchAdapter(crate::Db::with_columns(path, 1).unwrap())
 	}
 
-	fn with_options(_options: &Self::Options) -> Self {
-		unimplemented!("Internal options are private.");
+	fn with_options(options: &Self::Options) -> Self {
+		BenchAdapter(crate::Db::open(options, true).unwrap())
 	}
 
 	fn get(&self, key: &db_bench::Key) -> Option<db_bench::Value> {
@@ -40,7 +45,46 @@ impl db_bench::Db for BenchAdapter {
 	}
 }
 
-fn main() {
-	db_bench::run::<BenchAdapter>();
+/// Stress tests (warning erase db first).
+#[derive(Debug, StructOpt)]
+pub struct Stress {
+	#[structopt(flatten)]
+	pub shared: Shared,
+
+	/// Number of reading threads [default: 4].
+	#[structopt(long)]
+	pub readers: Option<usize>,
+
+	/// Number of writing threads [default: 1].
+	#[structopt(long)]
+	pub writers: Option<usize>,
+
+	/// Total numbet of inserted commits.
+	#[structopt(long)]
+	pub commits: Option<usize>,
+
+	/// Random seed used for key generation.
+	#[structopt(long)]
+	pub seed: Option<u64>,
+
+	/// Open an existing database.
+	#[structopt(long)]
+	pub append: bool,
+
+	/// Do not apply pruning.
+	#[structopt(long)]
+	pub archive: bool,
 }
 
+impl Stress {
+	pub(super) fn get_args(&self) -> db_bench::Args {
+		db_bench::Args {
+			readers: self.readers.unwrap_or(4),
+			writers: self.writers.unwrap_or(1),
+			commits: self.commits.unwrap_or(100_000),
+			seed: self.seed.clone(),
+			append: self.append,
+			archive: self.archive,
+		}
+	}
+}

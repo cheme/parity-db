@@ -21,6 +21,7 @@ pub use db::{Key, Value, Db};
 
 use std::{sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc, }, thread};
 use rand::{SeedableRng, RngCore};
+use std::path::PathBuf;
 
 static COMMITS: AtomicUsize = AtomicUsize::new(0);
 //static QUERIES: AtomicUsize = AtomicUsize::new(0);
@@ -42,13 +43,13 @@ Options:
 ";
 
 #[derive(Clone)]
-struct Args {
-	readers: usize,
-	commits: usize,
-	writers: usize,
-	seed: Option<u64>,
-	archive: bool,
-	append: bool,
+pub struct Args {
+	pub readers: usize,
+	pub commits: usize,
+	pub writers: usize,
+	pub seed: Option<u64>,
+	pub archive: bool,
+	pub append: bool,
 }
 
 impl Default for Args {
@@ -173,14 +174,21 @@ fn reader<D: Db>(_db: Arc<D>, shutdown: Arc<AtomicBool>) {
 
 pub fn run<D: Db>() {
 	env_logger::try_init().unwrap();
-	let path: std::path::PathBuf = "./test_db".into();
-	let args = Arc::new(Args::parse());
-	let shutdown = Arc::new(AtomicBool::new(false));
-	let pool = Arc::new(SizePool::from_histogram(&sizes::KUSAMA_STATE_DISTRIBUTION));
+	let path: PathBuf = "./test_db".into();
+	let args = Args::parse();
 	if path.exists() && !args.append {
 		std::fs::remove_dir_all(path.as_path()).unwrap();
 	}
-	let db = Arc::new(Db::open(path.as_path())) as Arc<D>;
+	let db = Db::open(path.as_path());
+
+	run_internal::<D>(args, db);
+}
+
+pub fn run_internal<D: Db>(args: Args, db: D) {
+	let args = Arc::new(args);
+	let shutdown = Arc::new(AtomicBool::new(false));
+	let pool = Arc::new(SizePool::from_histogram(&sizes::KUSAMA_STATE_DISTRIBUTION));
+	let db = Arc::new(db) as Arc<D>;
 	let start = std::time::Instant::now();
 
 	let mut threads = Vec::new();

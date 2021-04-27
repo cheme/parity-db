@@ -18,7 +18,10 @@ pub type Key = [u8; 32];
 pub type Value = Vec<u8>;
 
 pub trait Db: Send + Sync + 'static {
+	type Options;
+
 	fn open(path: &std::path::Path) -> Self;
+	fn with_options(options: &Self::Options) -> Self;
 	fn get(&self, key: &Key) -> Option<Value>;
 	fn commit<I: IntoIterator<Item=(Key, Option<Value>)>>(&self, tx: I);
 }

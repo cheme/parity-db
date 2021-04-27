@@ -24,6 +24,13 @@ snap = "1.0.4"
 snappy = "0.4.0"
 structopt = { version = "0.3.8", optional = true }
 env_logger = { version = "0.8.3", optional = true }
+# TODO remove this dependency (move code to admin
+# or admin command ot bench/bin).
+db-bench = { path = "bench/core", optional = true }
+
+# TODO could also gat behind admin feature.
+[target.'cfg(all(not(windows), not(target_env = "musl")))'.dependencies]
+jemallocator = "0.3.0"
 
 [dev-dependencies]
 env_logger = "0.8.2"
@@ -42,7 +49,12 @@ members = [
 ]
 
 [features]
+default = [
+# TODO remove this from default
+  "admin",
+]
 admin = [
 	"structopt",
 	"env_logger",
+	"db-bench",
 ]

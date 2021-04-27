@@ -26,14 +26,13 @@
 //		state_col.preimage = true;
 //		state_col.uniform = true;
 //
-// Passing parameter to define this can be a bit tedious,
-// defining a column config file could be good.
-// TODO actually file metadata exists, just need to parse
-// it a bit more (currently only validate same conf).
+// TODO Passing parameter to define this is be a bit tedious,
+// using a existing metadata file could be good.
 
 use std::path::PathBuf;
-
 use structopt::StructOpt;
+
+mod bench;
 
 /// Command line admin client entry point.
 /// Uses default column definition.
@@ -117,6 +116,19 @@ pub fn run() {
 				.expect("Invalid db");
 			loop { }
 		},
+		SubCommand::Stress(bench) => {
+			let args = bench.get_args();
+			// avoid deleting folders by mistake.
+			options.path.push("test_db");
+			if options.path.exists() && !args.append {
+				std::fs::remove_dir_all(options.path.as_path()).unwrap();
+			}
+
+			use db_bench::Db;
+			let db = bench::BenchAdapter::with_options(&options);
+
+			db_bench::run_internal(args, db);
+		},
 	}
 }
 
@@ -192,6 +204,8 @@ pub enum SubCommand {
 	Run(Run),
 	/// Check db content.
 	Check(Check),
+	/// Stress tests.
+	Stress(bench::Stress),
 }
 
 impl Cli {
@@ -208,6 +222,9 @@ impl Cli {
 			},
 			SubCommand::Check(check) => {
 				&check.shared
+			},
+			SubCommand::Stress(bench) => {
+				&bench.shared
 			},
 		}
 	}
