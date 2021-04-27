@@ -100,6 +100,7 @@ pub fn run() {
 			if !check.index_value {
 				// TODO use a enum with structopt and all...
 				println!("Require one of the following check flag: index_value");
+				return;
 			}
 			let check_param = crate::db::check::CheckParam::new(
 				check.column,
