@@ -59,7 +59,12 @@ pub struct Stress {
 	#[structopt(long)]
 	pub writers: Option<usize>,
 
-	/// Total numbet of inserted commits.
+	/// Start commit index.
+	#[structopt(long)]
+	pub start_commit: Option<usize>,
+
+
+	/// Total number of inserted commits.
 	#[structopt(long)]
 	pub commits: Option<usize>,
 
@@ -74,6 +79,10 @@ pub struct Stress {
 	/// Do not apply pruning.
 	#[structopt(long)]
 	pub archive: bool,
+
+	/// Do only check (requires append flag).
+	#[structopt(long)]
+	pub check_only: bool,
 }
 
 impl Stress {
@@ -85,6 +94,8 @@ impl Stress {
 			seed: self.seed.clone(),
 			append: self.append,
 			archive: self.archive,
+			check_only: self.check_only,
+			start_commit: self.start_commit.unwrap_or(0),
 		}
 	}
 }

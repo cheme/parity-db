@@ -27,6 +27,9 @@ static COMMITS: AtomicUsize = AtomicUsize::new(0);
 //static QUERIES: AtomicUsize = AtomicUsize::new(0);
 
 const COMMIT_SIZE: usize = 100;
+// Note on db, this is equal to COMMIT_SIZE.
+// Having smaller allow validating a given amount
+// of keys.
 const COMMIT_PRUNE_SIZE: usize = 90;
 const COMMIT_PRUNE_WINDOW: usize = 2000;
 
@@ -50,6 +53,8 @@ pub struct Args {
 	pub seed: Option<u64>,
 	pub archive: bool,
 	pub append: bool,
+	pub check_only: bool,
+	pub start_commit: usize,
 }
 
 impl Default for Args {
@@ -61,6 +66,8 @@ impl Default for Args {
 			append: false,
 			seed: None,
 			archive: false,
+			check_only: false,
+			start_commit: 0,
 		}
 	}
 }
@@ -128,25 +135,26 @@ impl Args {
 	}
 }
 
-fn informant(shutdown: Arc<AtomicBool>, total: usize) {
+fn informant(shutdown: Arc<AtomicBool>, total: usize, start: usize) {
 	let mut last = 0;
 	let mut last_time = std::time::Instant::now();
 	while !shutdown.load(Ordering::Relaxed) {
 		thread::sleep(std::time::Duration::from_secs(1));
 		let commits = COMMITS.load(Ordering::Acquire);
 		let now = std::time::Instant::now();
-		println!("{}/{} commits, {} cps", commits, total,  ((commits - last) as f64) / (now - last_time).as_secs_f64());
+		println!("{}/{} commits, {} cps", commits - start, total,  ((commits - last) as f64) / (now - last_time).as_secs_f64());
 		last = commits;
 		last_time = now;
 	}
 }
 
 fn writer<D: Db>(db: Arc<D>, args: Arc<Args>, pool: Arc<SizePool>, shutdown: Arc<AtomicBool>) {
-	let mut key: u64 = 0;
+	// Note that multiple worker will run on same range concurrently.
+	let mut key: u64 = (args.start_commit * COMMIT_SIZE) as u64;
 	let commit_size = COMMIT_SIZE;
 	let mut commit = Vec::with_capacity(commit_size);
 
-	for n in 0 .. args.commits {
+	for n in args.start_commit .. args.start_commit + args.commits {
 		if shutdown.load(Ordering::Relaxed) { break; }
 		for _ in 0 .. commit_size {
 			commit.push((pool.key(key), Some(pool.value(key))));
@@ -193,48 +201,54 @@ pub fn run_internal<D: Db>(args: Args, db: D) {
 
 	let mut threads = Vec::new();
 
-	{
-		let commits = args.commits;
-		let shutdown = shutdown.clone();
-		threads.push(thread::spawn(move || informant(shutdown, commits)));
+	COMMITS.store(args.start_commit, Ordering::SeqCst);
+
+	if !args.check_only {
+		{
+			let commits = args.commits;
+			let start = args.start_commit;
+			let shutdown = shutdown.clone();
+			threads.push(thread::spawn(move || informant(shutdown, commits, start)));
+		}
+
+		for i in 0 .. args.readers {
+			let db = db.clone();
+			let shutdown = shutdown.clone();
+
+			threads.push(
+				thread::Builder::new()
+				.name(format!("reader {}", i))
+				.spawn(move || reader(db, shutdown))
+				.unwrap()
+			);
+		}
+
+		for i in 0 .. args.writers {
+			let db = db.clone();
+			let shutdown = shutdown.clone();
+			let pool = pool.clone();
+			let args = args.clone();
+
+			threads.push(
+				thread::Builder::new()
+				.name(format!("writer {}", i))
+				.spawn(move || writer(db, args, pool, shutdown))
+				.unwrap()
+			);
+		}
+
+		while COMMITS.load(Ordering::Relaxed) < args.start_commit + args.commits {
+			thread::sleep(std::time::Duration::from_millis(50));
+		}
+		shutdown.store(true, Ordering::SeqCst);
 	}
-
-	for i in 0 .. args.readers {
-		let db = db.clone();
-		let shutdown = shutdown.clone();
-
-		threads.push(
-			thread::Builder::new()
-			.name(format!("reader {}", i))
-			.spawn(move || reader(db, shutdown))
-			.unwrap()
-		);
-	}
-
-	for i in 0 .. args.writers {
-		let db = db.clone();
-		let shutdown = shutdown.clone();
-		let pool = pool.clone();
-		let args = args.clone();
-
-		threads.push(
-			thread::Builder::new()
-			.name(format!("writer {}", i))
-			.spawn(move || writer(db, args, pool, shutdown))
-			.unwrap()
-		);
-	}
-
-	while COMMITS.load(Ordering::Relaxed) < args.commits {
-		thread::sleep(std::time::Duration::from_millis(50));
-	}
-	shutdown.store(true, Ordering::SeqCst);
 
 	for t in threads.into_iter() {
 		t.join().unwrap();
 	}
 
 	let commits = COMMITS.load(Ordering::SeqCst);
+	let commits = commits - args.start_commit;
 	let elapsed = start.elapsed().as_secs_f64();
 
 	println!(
@@ -250,23 +264,30 @@ pub fn run_internal<D: Db>(args: Args, db: D) {
 	let start = std::time::Instant::now();
 	let pruned_per_commit = if args.archive { 0u64 } else { COMMIT_PRUNE_SIZE as u64 };
 	let mut queries = 0;
-	for nc in 0u64 .. commits as u64 {
-		if nc % 1000 == 0 {
+	for nc in args.start_commit as u64 .. (args.start_commit + commits) as u64 {
+		let counter = nc - args.start_commit as u64;
+		if counter % 1000 == 0 {
 			println!(
 				"Query {}/{}",
-				nc,
+				counter,
 				commits,
 			);
 		}
-		if commits > COMMIT_PRUNE_WINDOW && nc < (commits - COMMIT_PRUNE_WINDOW) as u64 {
-			for key in (nc * COMMIT_SIZE as u64) .. (nc * COMMIT_SIZE as u64 + pruned_per_commit) {
+		let commits  = (args.start_commit + commits) as u64;
+		let prune_window: u64 = COMMIT_PRUNE_WINDOW as u64;
+		let start = if commits > prune_window && nc < commits - prune_window {
+			let end = nc * COMMIT_SIZE as u64 + pruned_per_commit;
+			for key in (nc * COMMIT_SIZE as u64) .. end {
 				let k = pool.key(key);
 				let db_val = db.get(&k);
 				queries += 1;
 				assert_eq!(None, db_val);
 			}
-		}
-		for key in (nc * COMMIT_SIZE as u64 + pruned_per_commit) .. (nc + 1) * (COMMIT_SIZE as u64) {
+			end
+		} else {
+			nc * COMMIT_SIZE as u64
+		};
+		for key in start .. (nc + 1) * (COMMIT_SIZE as u64) {
 			let k = pool.key(key);
 			let val = pool.value(key);
 			let db_val = db.get(&k);
@@ -283,4 +304,3 @@ pub fn run_internal<D: Db>(args: Args, db: D) {
 		queries as f64  / elapsed
 	);
 }
-
