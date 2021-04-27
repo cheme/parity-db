@@ -113,9 +113,11 @@ pub fn run() {
 			db.check_from_index(check_param).unwrap();
 		},
 		SubCommand::Run(_run) => {
-			crate::db::Db::open(&options, false)
+			let _db = crate::db::Db::open(&options, false)
 				.expect("Invalid db");
-			loop { }
+			loop {
+				std::thread::sleep(std::time::Duration::from_millis(100));
+			}
 		},
 		SubCommand::Stress(bench) => {
 			let args = bench.get_args();

@@ -559,7 +559,7 @@ impl Column {
 		let mut tables = self.tables.write();
 		let reindex = self.reindex.write(); // keeping it locked until end.
 		if !reindex.queue.is_empty() {
-			return Err(Error::InvalidConfiguration("Db need ot be flush before runnig admin method.".into()));
+			return Err(Error::InvalidConfiguration("Db need to be flush before runnig admin method.".into()));
 		}
 		let compression = Compress::new(compression_target, compression_treshold);
 		// store index as backup
@@ -697,7 +697,7 @@ impl Column {
 		let tables = self.tables.write();
 		let reindex = self.reindex.write();
 		if !reindex.queue.is_empty() {
-			return Err(Error::InvalidConfiguration("Db need ot be flush before runnig admin method.".into()));
+			return Err(Error::InvalidConfiguration("Db need to be flush before runnig admin method.".into()));
 		}
 
 		let index_bits = tables.index.id.index_bits();
