@@ -309,7 +309,7 @@ impl IndexTable {
 		while chunk_index < total_chunks {
 			if let Some(step) = with_progress.as_ref() {
 				if chunk_index % step == 0 {
-					log::warn!(target: "parity-db", "Chunk iteration at {}", chunk_index);
+					log::info!(target: "parity-db", "Chunk iteration at {}", chunk_index);
 				}
 			}
 			let mut entries: [Entry; CHUNK_ENTRIES] = {

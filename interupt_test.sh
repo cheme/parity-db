@@ -3,11 +3,12 @@
 cargo build --release --all-features
 rm -r ./test_db
 counter=1
-step=20000
+iteration=10
+step=30000
 kill=15
-# TODO also test with 9 when 15 get better.
-while [ $counter -le 100 ]
+while [ $counter -le $iteration ]
 do
+				echo "step $counter"
 				counter2=$(($counter * $step))
 				./target/release/admin stress \
 								--nb-columns 1 \
@@ -16,10 +17,11 @@ do
 								--start-commit $counter2 \
 								--commits $step \
 								--append \
+								--archive \
 								&
-				sleep 2
+				sleep 3
 				pkill -$kill -f "admin stress"
-				sleep 1
+				sleep 2
 				((counter++))
 done
 # flush logs
@@ -29,7 +31,7 @@ done
 				&
 sleep 2
 pkill -15 -f "admin run"
-sleep 1
+sleep 2
 ./target/release/admin check \
 				--nb-columns 1 \
 				--index-value \

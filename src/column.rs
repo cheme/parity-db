@@ -248,6 +248,7 @@ impl Column {
 		let tables = self.tables.upgradable_read();
 		let reindex = self.reindex.upgradable_read();
 		if Self::search_index(key, &tables.index, &*tables, log)?.is_some() {
+			println!("Skipped indexing");
 			return Ok(PlanOutcome::Skipped);
 		}
 		match tables.index.write_insert_plan(key, address, None, log)? {
@@ -703,6 +704,7 @@ impl Column {
 		let index_bits = tables.index.id.index_bits();
 		let end = check_param.bound
 			.map(|len| check_param.from.clone().unwrap_or(0) + len);
+		let mut nb_entry = 0;
 		tables.index.for_all(check_param.from.clone(), end, |key, entry| {
 			let mut result = None;
 			let size_tier = entry.address(index_bits).size_tier() as usize;
@@ -732,6 +734,7 @@ impl Column {
 							println!("Value: {}", hex(&value));
 						}
 					}
+					nb_entry += 1;
 				},
 				Ok(None) => {
 					println!("Missing value for index entry: {:x}", entry.0);
@@ -758,6 +761,7 @@ impl Column {
 			result
 		}, Some(500));
 	
+		println!("Checked {:?} valid entries.", nb_entry);
 		Ok(())
 	}
 
