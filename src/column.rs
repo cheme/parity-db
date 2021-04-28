@@ -113,7 +113,7 @@ impl Column {
 	}
 
 	fn compress_internal(compression: &Compress, key: &Key, value: &[u8], tables: &Tables) -> (Option<Vec<u8>>, usize) {
-		let (len, result) = if value.len() > compression.treshold {
+		let (len, result) = if value.len() > compression.treshold as usize {
 			let cvalue = compression.compress(value);
 			if cvalue.len() <= value.len() {
 				(cvalue.len(), Some(cvalue))
@@ -559,8 +559,8 @@ impl Column {
 	// Also require empty log and should not run when logger worker is active.
 	pub(crate) fn migrate_column(
 		&mut self,
-		compression_target: crate::compress::CompressType,
-		compression_treshold: usize,
+		compression_target: crate::compress::CompressionType,
+		compression_treshold: u32,
 		log: &Log,
 	) -> Result<()> {
 		let mut tables = self.tables.write();

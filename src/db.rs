@@ -613,8 +613,8 @@ impl DbInner {
 	pub(crate) fn migrate_column(
 		mut self,
 		column: Option<u8>,
-		compression_target: crate::compress::CompressType,
-		compression_threshold: usize,
+		compression_target: crate::compress::CompressionType,
+		compression_threshold: u32,
 	) -> Result<()> {
 		let salt = self.columns[0].salt();
 		if let Some(col) = column {

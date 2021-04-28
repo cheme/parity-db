@@ -68,7 +68,7 @@ pub fn run() {
 		let (a, b) = enc.split_at(split);
 		let col_ix: u8 = a.parse().expect("compress should be 'col_index=compress_as_u8'");
 		let c: u8 = b[1..].parse().expect("compress should be 'col_index=compress_as_u8'");
-		let compress: crate::compress::CompressType = c.into();
+		let compress: crate::compress::CompressionType = c.into();
 		options.columns[col_ix as usize].compression = compress.into();
 	}
 //	let db = crate::db::DbInner
@@ -87,7 +87,7 @@ pub fn run() {
 		SubCommand::Compress(stat) => {
 			let db = crate::db::DbInner::open(&options, false)
 				.expect("Invalid db");
-			let compression_target = crate::compress::CompressType::from(stat.compression);
+			let compression_target = crate::compress::CompressionType::from(stat.compression);
 			let compression_threshold = stat.compression_threshold
 				.unwrap_or(4096);
 
@@ -265,7 +265,7 @@ pub struct Compress {
 
 	/// Compression threshold to use.
 	#[structopt(long)]
-	pub compression_threshold: Option<usize>,
+	pub compression_threshold: Option<u32>,
 }
 
 /// Run with worker, allows flushing logs.
