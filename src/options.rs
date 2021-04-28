@@ -135,7 +135,7 @@ impl Default for ColumnOptions {
 			uniform: false,
 			ref_counted: false,
 			compression: crate::compress::CompressType::NoCompression,
-			compression_treshold: usize::max_value(),
+			compression_treshold: 4096,
 			sizes: [96, 128, 192, 256, 320, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192, 16384, 32768],
 		}
 	}

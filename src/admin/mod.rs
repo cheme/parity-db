@@ -89,7 +89,7 @@ pub fn run() {
 				.expect("Invalid db");
 			let compression_target = crate::compress::CompressType::from(stat.compression);
 			let compression_threshold = stat.compression_threshold
-				.unwrap_or(usize::max_value());
+				.unwrap_or(4096);
 
 			db.migrate_column(stat.column, compression_target, compression_threshold)
 				.unwrap();
