@@ -142,7 +142,7 @@ fn total_chunks(index_bits: u8) -> u64 {
 }
 
 fn file_size(index_bits: u8) -> u64 {
-	total_entries(index_bits) * 8 + META_SIZE as u64
+	total_entries(index_bits) * (ENTRY_LEN as u64 / 8) + META_SIZE as u64
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
