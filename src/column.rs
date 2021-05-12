@@ -22,11 +22,14 @@ use crate::{
 	table::{TableId as ValueTableId, ValueTable, Key, Value},
 	log::{Log, LogOverlays, LogReader, LogWriter, LogAction},
 	display::hex,
-	index::{IndexTable, TableId as IndexTableId, PlanOutcome, Address},
+	index::{TableId as IndexTableId, PlanOutcome, Address},
 	options::Options,
 	stats::ColumnStats,
 };
 use crate::compress::Compress;
+use crate::index::EntryTrait as _;
+
+type IndexTable = crate::index::IndexTable<crate::index::EntryStandard>;
 
 const START_BITS: u8 = 16;
 const MAX_REBALANCE_BATCH: u32 = 1024;

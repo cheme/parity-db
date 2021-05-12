@@ -15,6 +15,7 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::convert::TryInto;
+use std::marker::PhantomData;
 use parking_lot::{RwLockUpgradableReadGuard, RwLock};
 use crate::{
 	error::{Error, Result},
@@ -24,62 +25,96 @@ use crate::{
 	stats::{self, ColumnStats},
 };
 
-const CHUNK_LEN: usize = CHUNK_ENTRIES  * ENTRY_LEN as usize / 8; // 512 bytes
-const CHUNK_ENTRIES: usize = 1 << CHUNK_ENTRIES_BITS;
-const CHUNK_ENTRIES_BITS: u8 = 5;
+// const CHUNK_LEN: usize = Self::CHUNK_ENTRIES  * Self::ENTRY_LEN as usize / 8; // 512 bytes
+const CHUNK_LEN: usize = 512;
 const HEADER_SIZE: usize = 512;
 const META_SIZE: usize = crate::table::SIZE_TIERS * 1024; // Contains header and column stats
 const KEY_LEN: usize = 32;
-const ENTRY_LEN: u8 = 128;
-const ENTRY_BYTES: u8 = ENTRY_LEN / 8;
 
 const EMPTY_CHUNK: Chunk = [0u8; CHUNK_LEN];
 
 pub type Key = [u8; KEY_LEN];
 pub type Chunk = [u8; CHUNK_LEN];
 
+// TODO rename to `EntrySubCollection`.
 #[derive(PartialEq, Eq)]
 #[repr(transparent)]
 pub struct Entry((u64, u64));
 
-impl Entry {
-	#[inline]
-	fn new(address: Address, key_material: u64, index_bits: u8) -> Entry { // TODO add subco
-		Entry(((key_material << Self::address_bits(index_bits)) | address.as_u64(), 0))
-	}
+// TODO rename to `Entry`.
+#[derive(PartialEq, Eq)]
+#[repr(transparent)]
+pub struct EntryStandard(u64);
+
+/// Entry manipulation.
+/// Trait allows multiple entry layout.
+pub trait EntryTrait {
+	const CHUNK_ENTRIES: usize;
+	const CHUNK_ENTRIES_BITS: u8;
+	const ENTRY_LEN: u8;
+	const ENTRY_BYTES: u8;
+	type InnerRep;
+	type Entries;
+
+	fn new(address: Address, key_material: u64, index_bits: u8) -> Self;
+	fn address(&self, index_bits: u8) -> Address;
+	fn key_material(&self, index_bits: u8) -> u64;
+	fn is_empty(&self) -> bool;
+	fn as_inner(&self) -> Self::InnerRep;
+	fn empty() -> Self;
+	fn from_inner(inner: Self::InnerRep) -> Self;
+	fn transmute_chunk(chunk: [u8; CHUNK_LEN]) -> Self::Entries;
+	fn write_entry(&self, at: usize, chunk: &mut [u8; CHUNK_LEN]);
+	fn inner_from_chunk(ix: usize, chunk: &[u8]) -> Self::InnerRep;
 
 	#[inline]
-	pub fn address_bits(index_bits: u8) -> u8 {
+	fn address_bits(index_bits: u8) -> u8 {
 		// with n index bits there are n * 64 possible entries and 16 size tiers
-		index_bits + CHUNK_ENTRIES_BITS + crate::table::SIZE_TIERS_BITS
+		index_bits + Self::CHUNK_ENTRIES_BITS + crate::table::SIZE_TIERS_BITS
 	}
 
 	#[inline]
-	pub fn last_address(index_bits: u8) -> u64 {
+	fn last_address(index_bits: u8) -> u64 {
 		(1u64 << Self::address_bits(index_bits)) - 1
-	}
-
-	#[inline]
-	pub fn address(&self, index_bits: u8) -> Address {
-		Address::from_u64((self.0).0 & Self::last_address(index_bits))
-	}
-
-	#[inline]
-	pub fn key_material(&self, index_bits: u8) -> u64 {
-		(self.0).0 >> Self::address_bits(index_bits)
 	}
 
 	#[inline]
 	fn extract_key(key: u64, index_bits: u8) -> u64 {
 		(key << index_bits) >> Self::address_bits(index_bits)
 	}
+}
+
+impl EntryTrait for Entry {
+	// const CHUNK_LEN: usize = Self::CHUNK_ENTRIES  * Self::ENTRY_LEN as usize / 8; // 512 bytes
+	const CHUNK_ENTRIES: usize = 1 << Self::CHUNK_ENTRIES_BITS;
+	const CHUNK_ENTRIES_BITS: u8 = 5;
+	const ENTRY_LEN: u8 = 128;
+	const ENTRY_BYTES: u8 = Self::ENTRY_LEN / 8;
+
+	type InnerRep = (u64, u64);
+	type Entries = [Entry; Self::CHUNK_ENTRIES];
 
 	#[inline]
-	pub fn is_empty(&self) -> bool {
+	fn new(address: Address, key_material: u64, index_bits: u8) -> Self {
+		Entry(((key_material << Self::address_bits(index_bits)) | address.as_inner(), 0))
+	}
+
+	#[inline]
+	fn address(&self, index_bits: u8) -> Address {
+		Address::from_u64((self.0).0 & Self::last_address(index_bits))
+	}
+
+	#[inline]
+	fn key_material(&self, index_bits: u8) -> u64 {
+		(self.0).0 >> Self::address_bits(index_bits)
+	}
+
+	#[inline]
+	fn is_empty(&self) -> bool {
 		(self.0).0 == 0
 	}
 
-	fn as_u64(&self) -> (u64, u64) {
+	fn as_inner(&self) -> Self::InnerRep {
 		self.0
 	}
 
@@ -87,10 +122,101 @@ impl Entry {
 		Entry((0, 0))
 	}
 
-	fn from_u64(e: u64, s: u64) -> Self {
-		Entry((e, s))
+	fn from_inner(inner: (u64, u64)) -> Self {
+		Entry(inner)
+	}
+
+	#[inline(always)]
+	fn transmute_chunk(chunk: [u8; CHUNK_LEN]) -> Self::Entries {
+		let mut result: Self::Entries = unsafe { std::mem::transmute(chunk) };
+		if !cfg!(target_endian = "little") {
+			for i in 0 .. Self::CHUNK_ENTRIES {
+				result[i] = Self::from_inner((u64::from_le((result[i].0).0), u64::from_le((result[i].0).1)));
+			}
+		}
+		result
+	}
+
+	#[inline(always)]
+	fn write_entry(&self, at: usize, chunk: &mut [u8; CHUNK_LEN]) {
+		chunk[at * Self::ENTRY_BYTES as usize .. at * Self::ENTRY_BYTES as usize + 8].copy_from_slice(&self.as_inner().0.to_le_bytes());
+		chunk[at * Self::ENTRY_BYTES as usize + 8 .. at * Self::ENTRY_BYTES as usize + Self::ENTRY_BYTES as usize].copy_from_slice(&self.as_inner().1.to_le_bytes());
+	}
+
+	#[inline(always)]
+	fn inner_from_chunk(at: usize, chunk: &[u8]) -> Self::InnerRep {
+		(
+			u64::from_le_bytes(chunk[at * Self::ENTRY_BYTES as usize .. at * Self::ENTRY_BYTES as usize + 8].try_into().unwrap()),
+			u64::from_le_bytes(chunk[at * Self::ENTRY_BYTES as usize + 8 .. at * Self::ENTRY_BYTES as usize + Self::ENTRY_BYTES as usize].try_into().unwrap()),
+		)
 	}
 }
+
+impl EntryTrait for EntryStandard {
+	// const CHUNK_LEN: usize = Self::CHUNK_ENTRIES  * Self::ENTRY_LEN as usize / 8; // 512 bytes
+	const CHUNK_ENTRIES: usize = 1 << Self::CHUNK_ENTRIES_BITS;
+	const CHUNK_ENTRIES_BITS: u8 = 6;
+	const ENTRY_LEN: u8 = 64;
+	const ENTRY_BYTES: u8 = Self::ENTRY_LEN / 8;
+
+	type InnerRep = u64;
+	type Entries = [EntryStandard; Self::CHUNK_ENTRIES];
+
+	#[inline]
+	fn new(address: Address, key_material: u64, index_bits: u8) -> Self {
+		EntryStandard((key_material << Self::address_bits(index_bits)) | address.as_inner())
+	}
+
+	#[inline]
+	fn address(&self, index_bits: u8) -> Address {
+		Address::from_u64(self.0 & Self::last_address(index_bits))
+	}
+
+	#[inline]
+	fn key_material(&self, index_bits: u8) -> u64 {
+		self.0 >> Self::address_bits(index_bits)
+	}
+
+	#[inline]
+	fn is_empty(&self) -> bool {
+		self.0 == 0
+	}
+
+	fn as_inner(&self) -> Self::InnerRep {
+		self.0
+	}
+
+	fn empty() -> Self {
+		EntryStandard(0)
+	}
+
+	fn from_inner(inner: u64) -> Self {
+		EntryStandard(inner)
+	}
+
+	#[inline(always)]
+	fn transmute_chunk(chunk: [u8; CHUNK_LEN]) -> Self::Entries {
+		let mut result: Self::Entries = unsafe { std::mem::transmute(chunk) };
+		if !cfg!(target_endian = "little") {
+			for i in 0 .. Self::CHUNK_ENTRIES {
+				result[i] = Self::from_inner(u64::from_le(result[i].0));
+			}
+		}
+		result
+	}
+
+	#[inline(always)]
+	fn write_entry(&self, at: usize, chunk: &mut [u8; CHUNK_LEN]) {
+		chunk[at * Self::ENTRY_BYTES as usize .. at * Self::ENTRY_BYTES as usize + Self::ENTRY_BYTES as usize].copy_from_slice(&self.as_inner().to_le_bytes());
+	}
+
+	#[inline(always)]
+	fn inner_from_chunk(at: usize, chunk: &[u8]) -> Self::InnerRep {
+		u64::from_le_bytes(chunk[at * Self::ENTRY_BYTES as usize .. at * Self::ENTRY_BYTES as usize + Self::ENTRY_BYTES as usize].try_into().unwrap())
+	}
+}
+
+
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 pub struct Address(u64);
@@ -112,7 +238,7 @@ impl Address {
 		(self.0 & 0x0f) as u8
 	}
 
-	pub fn as_u64(&self) -> u64 {
+	pub fn as_inner(&self) -> u64 {
 		self.0
 	}
 }
@@ -129,22 +255,23 @@ pub enum PlanOutcome {
 	Skipped,
 }
 
-pub struct IndexTable {
+pub struct IndexTable<E> {
 	pub id: TableId,
 	map: RwLock<Option<memmap2::MmapMut>>,
 	path: std::path::PathBuf,
+	_ph: PhantomData<E>,
 }
 
-fn total_entries(index_bits: u8) -> u64 {
-	total_chunks(index_bits) * CHUNK_ENTRIES as u64
+fn total_entries<E: EntryTrait>(index_bits: u8) -> u64 {
+	total_chunks(index_bits) * E::CHUNK_ENTRIES as u64
 }
 
 fn total_chunks(index_bits: u8) -> u64 {
 	1u64 << index_bits
 }
 
-fn file_size(index_bits: u8) -> u64 {
-	total_entries(index_bits) * ENTRY_BYTES as u64 + META_SIZE as u64
+fn file_size<E: EntryTrait>(index_bits: u8) -> u64 {
+	total_entries::<E>(index_bits) * E::ENTRY_BYTES as u64 + META_SIZE as u64
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
@@ -179,8 +306,8 @@ impl TableId {
 		total_chunks(self.index_bits())
 	}
 
-	pub fn total_entries(&self) -> u64 {
-		total_entries(self.index_bits())
+	pub fn total_entries<E: EntryTrait>(&self) -> u64 {
+		total_entries::<E>(self.index_bits())
 	}
 }
 
@@ -190,8 +317,8 @@ impl std::fmt::Display for TableId {
 	}
 }
 
-impl IndexTable {
-	pub fn open_existing(path: &std::path::Path, id: TableId) -> Result<Option<IndexTable>> {
+impl<E: EntryTrait> IndexTable<E> {
+	pub fn open_existing(path: &std::path::Path, id: TableId) -> Result<Option<IndexTable<E>>> {
 		let mut path: std::path::PathBuf = path.into();
 		path.push(id.file_name());
 
@@ -203,23 +330,25 @@ impl IndexTable {
 			Ok(file) => file,
 		};
 
-		file.set_len(file_size(id.index_bits()))?;
+		file.set_len(file_size::<E>(id.index_bits()))?;
 		let map = unsafe { memmap2::MmapMut::map_mut(&file)? };
 		log::debug!(target: "parity-db", "Opened existing index {}", id);
 		Ok(Some(IndexTable {
 			id,
 			path,
 			map: RwLock::new(Some(map)),
+			_ph: PhantomData,
 		}))
 	}
 
-	pub fn create_new(path: &std::path::Path, id: TableId) -> IndexTable {
+	pub fn create_new(path: &std::path::Path, id: TableId) -> IndexTable<E> {
 		let mut path: std::path::PathBuf = path.into();
 		path.push(id.file_name());
 		IndexTable {
 			id,
 			path,
 			map: RwLock::new(None),
+			_ph: PhantomData,
 		}
 	}
 
@@ -245,18 +374,18 @@ impl IndexTable {
 		&map[offset .. offset + CHUNK_LEN]
 	}
 
-	fn find_entry(&self, key: u64, sub_index: usize, chunk: &[u8]) -> (Entry, usize) {
-		let partial_key = Entry::extract_key(key, self.id.index_bits());
-		for i in sub_index .. CHUNK_ENTRIES {
+	fn find_entry(&self, key: u64, sub_index: usize, chunk: &[u8]) -> (E, usize) {
+		let partial_key = E::extract_key(key, self.id.index_bits());
+		for i in sub_index .. E::CHUNK_ENTRIES {
 			let entry = Self::read_entry(&chunk, i);
 			if !entry.is_empty() && entry.key_material(self.id.index_bits()) == partial_key {
 				return (entry, i);
 			}
 		}
-		return (Entry::empty(), 0)
+		return (E::empty(), 0)
 	}
 
-	pub fn get(&self, key: &Key, sub_index: usize, log: &impl LogQuery) -> (Entry, usize) {
+	pub fn get(&self, key: &Key, sub_index: usize, log: &impl LogQuery) -> (E, usize) {
 		log::trace!(target: "parity-db", "{}: Querying {}", self.id, hex(&key));
 		let key = u64::from_be_bytes((key[0..8]).try_into().unwrap());
 		let chunk_index = self.chunk_index(key);
@@ -274,51 +403,36 @@ impl IndexTable {
 			return self.find_entry(key, sub_index, chunk);
 
 		}
-		return (Entry::empty(), 0)
+		return (E::empty(), 0)
 	}
 
-	pub fn entries(&self, chunk_index: u64, log: &impl LogQuery) -> [Entry; CHUNK_ENTRIES] {
+	pub fn entries(&self, chunk_index: u64, log: &impl LogQuery) -> E::Entries {
 		let mut chunk = [0; CHUNK_LEN];
 		if let Some(entry) = log.with_index(self.id, chunk_index, |chunk|
-			Self::transmute_chunk(*chunk)) {
+			E::transmute_chunk(*chunk)) {
 			return entry;
 		}
 		if let Some(map) = &*self.map.read() {
 			let source = Self::chunk_at(chunk_index, map);
 			chunk.copy_from_slice(source);
-			return Self::transmute_chunk(chunk);
+			return E::transmute_chunk(chunk);
 		}
-		return Self::transmute_chunk(EMPTY_CHUNK);
+		return E::transmute_chunk(EMPTY_CHUNK);
 	}
 
 	#[inline(always)]
-	fn transmute_chunk(chunk: [u8; CHUNK_LEN]) -> [Entry; CHUNK_ENTRIES] {
-		let mut result: [Entry; CHUNK_ENTRIES] = unsafe { std::mem::transmute(chunk) };
-		if !cfg!(target_endian = "little") {
-			for i in 0 .. CHUNK_ENTRIES {
-				result[i] = Entry::from_u64(u64::from_le((result[i].0).0), u64::from_le((result[i].0).1));
-			}
-		}
-		result
+	fn write_entry(entry: &E, at: usize, chunk: &mut [u8; CHUNK_LEN]) {
+		entry.write_entry(at, chunk)
 	}
 
 	#[inline(always)]
-	fn write_entry(entry: &Entry, at: usize, chunk: &mut [u8; CHUNK_LEN]) {
-		chunk[at * ENTRY_BYTES as usize .. at * ENTRY_BYTES as usize + 8].copy_from_slice(&entry.as_u64().0.to_le_bytes());
-		chunk[at * ENTRY_BYTES as usize + 8 .. at * ENTRY_BYTES as usize + ENTRY_BYTES as usize].copy_from_slice(&entry.as_u64().1.to_le_bytes());
-	}
-
-	#[inline(always)]
-	fn read_entry(chunk: &[u8], at: usize) -> Entry {
-		Entry::from_u64(
-			u64::from_le_bytes(chunk[at * ENTRY_BYTES as usize .. at * ENTRY_BYTES as usize + 8].try_into().unwrap()),
-			u64::from_le_bytes(chunk[at * ENTRY_BYTES as usize + 8 .. at * ENTRY_BYTES as usize + ENTRY_BYTES as usize].try_into().unwrap()),
-		)
+	fn read_entry(chunk: &[u8], at: usize) -> E {
+		E::from_inner(E::inner_from_chunk(at, chunk))
 	}
 
 	#[inline(always)]
 	fn chunk_index(&self, key: u64) -> u64 {
-		key >> (ENTRY_LEN - self.id.index_bits())
+		key >> (E::ENTRY_LEN - self.id.index_bits())
 	}
 
 	fn plan_insert_chunk(
@@ -330,15 +444,15 @@ impl IndexTable {
 		log: &mut LogWriter,
 	) -> Result<PlanOutcome> {
 		let chunk_index = self.chunk_index(key);
-		if address.as_u64() > Entry::last_address(self.id.index_bits()) {
+		if address.as_inner() > E::last_address(self.id.index_bits()) {
 			// Address overflow
 			log::warn!(target: "parity-db", "{}: Address space overflow at {}: {}", self.id, chunk_index, address);
 			return Ok(PlanOutcome::NeedReindex);
 		}
 		let mut chunk = [0; CHUNK_LEN];
 		chunk.copy_from_slice(source);
-		let partial_key = Entry::extract_key(key, self.id.index_bits());
-		let new_entry = Entry::new(address, partial_key, self.id.index_bits());
+		let partial_key = E::extract_key(key, self.id.index_bits());
+		let new_entry = E::new(address, partial_key, self.id.index_bits());
 		if let Some(i) = sub_index {
 			let entry = Self::read_entry(&chunk, i);
 			assert!(entry.key_material(self.id.index_bits()) == new_entry.key_material(self.id.index_bits()));
@@ -347,7 +461,7 @@ impl IndexTable {
 			log.insert_index(self.id, chunk_index, &chunk);
 			return Ok(PlanOutcome::Written);
 		}
-		for i in 0 .. CHUNK_ENTRIES {
+		for i in 0 .. E::CHUNK_ENTRIES {
 			let entry = Self::read_entry(&chunk, i);
 			if entry.is_empty() {
 				Self::write_entry(&new_entry, i, &mut chunk);
@@ -382,12 +496,12 @@ impl IndexTable {
 		let mut chunk = [0; CHUNK_LEN];
 		chunk.copy_from_slice(source);
 		let chunk_index = self.chunk_index(key);
-		let partial_key = Entry::extract_key(key, self.id.index_bits());
+		let partial_key = E::extract_key(key, self.id.index_bits());
 
 		let i = sub_index;
 		let entry = Self::read_entry(&chunk, i);
 		if !entry.is_empty() && entry.key_material(self.id.index_bits()) == partial_key {
-			let new_entry = Entry::empty();
+			let new_entry = E::empty();
 			Self::write_entry(&new_entry, i, &mut chunk);
 			log.insert_index(self.id, chunk_index, &chunk);
 			log::trace!(target: "parity-db", "{}: Removed at {}.{}", self.id, chunk_index, i);
@@ -420,7 +534,7 @@ impl IndexTable {
 			let file = std::fs::OpenOptions::new().write(true).read(true).create_new(true).open(self.path.as_path())?;
 			log::debug!(target: "parity-db", "Created new index {}", self.id);
 			//TODO: check for potential overflows on 32-bit platforms
-			file.set_len(file_size(self.id.index_bits()))?;
+			file.set_len(file_size::<E>(self.id.index_bits()))?;
 			*wmap = Some(unsafe { memmap2::MmapMut::map_mut(&file)? });
 			map = parking_lot::RwLockWriteGuard::downgrade_to_upgradable(wmap);
 		}
@@ -440,7 +554,7 @@ impl IndexTable {
 	}
 
 	pub fn validate_plan(&self, index: u64, log: &mut LogReader) -> Result<()> {
-		if index >= self.id.total_entries() {
+		if index >= self.id.total_entries::<E>() {
 			return Err(Error::Corruption("Bad index".into()));
 		}
 		let mut chunk = [0; CHUNK_LEN];
@@ -463,19 +577,19 @@ mod test {
 
 	#[test]
 	fn test_entries() {
-/*		let mut chunk = IndexTable::transmute_chunk(EMPTY_CHUNK);
+		let mut chunk = EntryStandard::transmute_chunk(EMPTY_CHUNK);
 		let mut chunk2 = EMPTY_CHUNK;
-		for i in 0 .. CHUNK_ENTRIES {
+		for i in 0 .. EntryStandard::CHUNK_ENTRIES {
 			use std::collections::hash_map::DefaultHasher;
 			use std::hash::{Hash, Hasher};
 			let mut hasher = DefaultHasher::new();
 			i.hash(&mut hasher);
 			let hash = hasher.finish();
-			let entry = Entry::from_u64(hash as u64);
+			let entry = EntryStandard::from_inner(hash as u64);
 			IndexTable::write_entry(&entry, i, &mut chunk2);
 			chunk[i] = entry;
 		}
 
-		assert!(IndexTable::transmute_chunk(chunk2) == chunk);*/
+		assert!(EntryStandard::transmute_chunk(chunk2) == chunk);
 	}
 }
