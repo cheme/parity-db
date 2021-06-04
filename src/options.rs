@@ -54,11 +54,14 @@ pub struct ColumnOptions {
 	pub compression: crate::compress::CompressionType,
 	/// Minimal value size treshold to attempt compressing a value.
 	pub compression_treshold: u32,
+	/// Use subcollection indexing.
+	pub subcollections: bool,
 }
 
 impl ColumnOptions {
 	fn as_string(&self) -> String {
-		format!("preimage: {}, uniform: {}, refc: {}, compression: {}, sizes: [{}]",
+		format!("preimage: {}, uniform: {}, refc: {}, compression: {}, sizes: [{}], \
+			subcollections: {}",
 			self.preimage,
 			self.uniform,
 			self.ref_counted,
@@ -69,7 +72,8 @@ impl ColumnOptions {
 				}
 				r.push_str(&s.to_string());
 				r
-			})
+			}),
+			self.subcollections,
 		)
 	}
 }
@@ -83,6 +87,7 @@ impl Default for ColumnOptions {
 			compression: crate::compress::CompressionType::NoCompression,
 			compression_treshold: 4096,
 			sizes: [96, 128, 192, 256, 320, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192, 16384, 32768],
+			subcollections: false,
 		}
 	}
 }
