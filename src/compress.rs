@@ -247,17 +247,21 @@ mod snap {
 			}
 		}
 
-		pub(super) fn compress(&self, mut value: &[u8]) -> Vec<u8> {
-			let mut encoder = snap::write::FrameEncoder::new(Vec::new());
-			std::io::copy(&mut value, &mut encoder).unwrap();
-			encoder.into_inner().unwrap()
+		pub(super) fn compress(&self, value: &[u8]) -> Vec<u8> {
+			use std::io::Write;
+			let mut buf = Vec::with_capacity(value.len() << 3);
+			let mut encoder = snap::write::FrameEncoder::new(&mut buf);
+			encoder.write(value).unwrap();
+			std::mem::drop(encoder);
+			buf
 		}
 
 		pub(super) fn decompress(&self, value: &[u8]) -> Vec<u8> {
+			use std::io::Read;
+			let mut buf = Vec::with_capacity(value.len());
 			let mut decoder = snap::read::FrameDecoder::new(value);
-			let mut result = Vec::new();
-			std::io::copy(&mut decoder, &mut result).unwrap();
-			result
+			decoder.read_to_end(&mut buf).unwrap();
+			buf
 		}
 	}
 }
