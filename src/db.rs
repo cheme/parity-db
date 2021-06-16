@@ -78,6 +78,12 @@ struct CommitQueue {
 }
 
 #[derive(Default)]
+struct SubRemoved {
+	column: ColId,
+	id: u64,
+}
+
+#[derive(Default)]
 struct IdentityKeyHash(u64);
 type IdentityBuildHasher = std::hash::BuildHasherDefault<IdentityKeyHash>;
 
@@ -117,7 +123,7 @@ struct DbInner {
 	commit_worker_cv: Condvar,
 	commit_work: Mutex<bool>,
 	// Overlay of most recent values int the commit queue. ColumnId -> (Key -> (RecordId, Value)).
-	commit_overlay: RwLock<Vec<HashMap<Key, (u64, Option<Value>, Option<u64>), IdentityBuildHasher>>>,
+	commit_overlay: RwLock<Vec<Overlay>>,
 	log_cv: Condvar,
 	log_queue_bytes: Mutex<u64>,
 	flush_worker_cv: Condvar,
@@ -127,10 +133,68 @@ struct DbInner {
 	next_reindex: AtomicU64,
 	collect_stats: bool,
 	bg_err: Mutex<Option<Arc<Error>>>,
+	subcollection_removal: Mutex<Vec<SubRemoved>>,
+	subcollection_removal_cv: Condvar,
 	_lock_file: std::fs::File,
 }
 
+struct Overlay {
+	changes: HashMap<Key, (u64, Option<Value>, Option<u64>), IdentityBuildHasher>,
+	locked_subcollection: std::collections::BTreeSet<u64>,
+}
+
+impl Overlay {
+	fn locked_subcollection(&self, subcollection: Option<u64>) -> bool {
+		subcollection.map(|c| self.locked_subcollection.contains(&c)).unwrap_or(false)
+	}
+}
+
 impl DbInner {
+	// User should ensure to not reuse subcollection id (lock on pending
+	// removal otherwhise).
+	fn wait_on_subcollection_removal(&self, col: ColId, subcollection: Option<u64>) {
+		if !self.commit_overlay.read()[col as usize].locked_subcollection(subcollection) {
+			return;
+		}
+		loop {
+			let mut removed = self.subcollection_removal.lock();
+			if removed.len() > 0 {
+				let mut overlays = self.commit_overlay.write();
+				for remove in removed.drain(..) {
+					overlays[remove.column as usize].locked_subcollection.remove(&remove.id);
+				}
+				if !overlays[col as usize].locked_subcollection(subcollection) {
+					return;
+				}
+			}
+			self.subcollection_removal_cv.wait(&mut removed);
+		}
+	}
+	fn wait_on_subcollection_removal_mut(
+		overlays: &mut Vec<Overlay>,
+		col: ColId,
+		subcollection: Option<u64>,
+		subcollection_removal: &Mutex<Vec<SubRemoved>>,
+		subcollection_removal_cv: &Condvar,
+	) {
+		if !overlays[col as usize].locked_subcollection(subcollection) {
+			return;
+		}
+		loop {
+			let mut removed = subcollection_removal.lock();
+			if removed.len() > 0 {
+				for remove in removed.drain(..) {
+					overlays[remove.column as usize].locked_subcollection.remove(&remove.id);
+				}
+				if !overlays[col as usize].locked_subcollection(subcollection) {
+					return;
+				}
+			}
+			subcollection_removal_cv.wait(&mut removed);
+		}
+	}
+
+
 	fn open(options: &Options) -> Result<DbInner> {
 		std::fs::create_dir_all(&options.path)?;
 		let mut lock_path: std::path::PathBuf = options.path.clone();
@@ -148,9 +212,10 @@ impl DbInner {
 				Column::Standard(crate::column::Column::open(c as ColId, &options, salt.clone())?)
 			};
 			columns.push(column);
-			commit_overlay.push(
-				HashMap::with_hasher(std::hash::BuildHasherDefault::<IdentityKeyHash>::default())
-			);
+			commit_overlay.push(Overlay {
+				changes: HashMap::with_hasher(std::hash::BuildHasherDefault::<IdentityKeyHash>::default()),
+				locked_subcollection: Default::default(),
+			});
 		}
 		log::debug!(target: "parity-db", "Opened db {:?}, salt={:?}", options, salt);
 		Ok(DbInner {
@@ -174,6 +239,8 @@ impl DbInner {
 			last_enacted: AtomicU64::new(1),
 			collect_stats: options.stats,
 			bg_err: Mutex::new(None),
+			subcollection_removal: Mutex::new(Vec::new()),
+			subcollection_removal_cv: Condvar::new(),
 			_lock_file: lock_file,
 		})
 	}
@@ -198,9 +265,10 @@ impl DbInner {
 
 	fn get(&self, col: ColId, key: &[u8], subcollection: Option<u64>) -> Result<Option<Value>> {
 		let key = col!(&self.columns[col as usize], hash, key, subcollection);
+		self.wait_on_subcollection_removal(col, subcollection);
 		let overlay = self.commit_overlay.read();
 		// Check commit overlay first
-		if let Some(v) = overlay.get(col as usize).and_then(|o| o.get(&key).map(|(_, v, _)| v.clone())) {
+		if let Some(v) = overlay.get(col as usize).and_then(|o| o.changes.get(&key).map(|(_, v, _)| v.clone())) {
 			return Ok(v);
 		}
 		// Go into tables and log overlay.
@@ -210,10 +278,11 @@ impl DbInner {
 
 	fn get_size(&self, col: ColId, key: &[u8], subcollection: Option<u64>) -> Result<Option<u32>> {
 		let key = col!(&self.columns[col as usize], hash, key, subcollection);
+		self.wait_on_subcollection_removal(col, subcollection);
 		let overlay = self.commit_overlay.read();
 		// Check commit overlay first
 		if let Some(l) = overlay.get(col as usize).and_then(
-			|o| o.get(&key).map(|(_, v, _)| v.as_ref().map(|v| v.len() as u32))
+			|o| o.changes.get(&key).map(|(_, v, _)| v.as_ref().map(|v| v.len() as u32))
 		) {
 			return Ok(l);
 		}
@@ -252,11 +321,18 @@ impl DbInner {
 
 			let mut bytes = 0;
 			for (c, k, v, s) in &commit {
+				Self::wait_on_subcollection_removal_mut(
+					&mut *overlay,
+					*c,
+					*s,
+					&self.subcollection_removal,
+					&self.subcollection_removal_cv,
+				);
 				bytes += k.len();
 				bytes += v.as_ref().map_or(0, |v|v.len());
 				// Don't add removed ref-counted values to overlay.
 				if !self.options.columns[*c as usize].ref_counted || v.is_some() {
-					overlay[*c as usize].insert(*k, (record_id, v.clone(), *s));
+					overlay[*c as usize].changes.insert(*k, (record_id, v.clone(), *s));
 				}
 			}
 
@@ -350,9 +426,17 @@ impl DbInner {
 			{
 				// Cleanup the commit overlay.
 				let mut overlay = self.commit_overlay.write();
-				for (c, key, _, _) in commit.changeset.iter() {
+				for (c, key, _, s) in commit.changeset.iter() {
+					Self::wait_on_subcollection_removal_mut(
+						&mut *overlay,
+						*c,
+						*s,
+						&self.subcollection_removal,
+						&self.subcollection_removal_cv,
+					);
+					
 					let overlay = &mut overlay[*c as usize];
-					if let std::collections::hash_map::Entry::Occupied(e) = overlay.entry(*key) {
+					if let std::collections::hash_map::Entry::Occupied(e) = overlay.changes.entry(*key) {
 						if e.get().0 == commit.id {
 							e.remove_entry();
 						}
