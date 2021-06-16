@@ -36,15 +36,13 @@ const EMPTY_CHUNK: Chunk = [0u8; CHUNK_LEN];
 pub type Key = [u8; KEY_LEN];
 pub type Chunk = [u8; CHUNK_LEN];
 
-// TODO rename to `EntrySubCollection`.
 #[derive(PartialEq, Eq)]
 #[repr(transparent)]
-pub struct Entry((u64, u64));
+pub struct EntrySubCollection((u64, u64));
 
-// TODO rename to `Entry`.
 #[derive(PartialEq, Eq)]
 #[repr(transparent)]
-pub struct EntryStandard(u64);
+pub struct Entry(u64);
 
 /// Entry manipulation.
 /// Trait allows multiple entry layout.
@@ -84,7 +82,7 @@ pub trait EntryTrait {
 	}
 }
 
-impl EntryTrait for Entry {
+impl EntryTrait for EntrySubCollection {
 	// const CHUNK_LEN: usize = Self::CHUNK_ENTRIES  * Self::ENTRY_LEN as usize / 8; // 512 bytes
 	const CHUNK_ENTRIES: usize = 1 << Self::CHUNK_ENTRIES_BITS;
 	const CHUNK_ENTRIES_BITS: u8 = 5;
@@ -92,11 +90,11 @@ impl EntryTrait for Entry {
 	const ENTRY_BYTES: u8 = Self::ENTRY_LEN / 8;
 
 	type InnerRep = (u64, u64);
-	type Entries = [Entry; Self::CHUNK_ENTRIES];
+	type Entries = [EntrySubCollection; Self::CHUNK_ENTRIES];
 
 	#[inline]
 	fn new(address: Address, key_material: u64, index_bits: u8) -> Self {
-		Entry(((key_material << Self::address_bits(index_bits)) | address.as_inner(), 0))
+		EntrySubCollection(((key_material << Self::address_bits(index_bits)) | address.as_inner(), 0))
 	}
 
 	#[inline]
@@ -119,11 +117,11 @@ impl EntryTrait for Entry {
 	}
 
 	fn empty() -> Self {
-		Entry((0, 0))
+		EntrySubCollection((0, 0))
 	}
 
 	fn from_inner(inner: (u64, u64)) -> Self {
-		Entry(inner)
+		EntrySubCollection(inner)
 	}
 
 	#[inline(always)]
@@ -152,7 +150,7 @@ impl EntryTrait for Entry {
 	}
 }
 
-impl EntryTrait for EntryStandard {
+impl EntryTrait for Entry {
 	// const CHUNK_LEN: usize = Self::CHUNK_ENTRIES  * Self::ENTRY_LEN as usize / 8; // 512 bytes
 	const CHUNK_ENTRIES: usize = 1 << Self::CHUNK_ENTRIES_BITS;
 	const CHUNK_ENTRIES_BITS: u8 = 6;
@@ -160,11 +158,11 @@ impl EntryTrait for EntryStandard {
 	const ENTRY_BYTES: u8 = Self::ENTRY_LEN / 8;
 
 	type InnerRep = u64;
-	type Entries = [EntryStandard; Self::CHUNK_ENTRIES];
+	type Entries = [Entry; Self::CHUNK_ENTRIES];
 
 	#[inline]
 	fn new(address: Address, key_material: u64, index_bits: u8) -> Self {
-		EntryStandard((key_material << Self::address_bits(index_bits)) | address.as_inner())
+		Entry((key_material << Self::address_bits(index_bits)) | address.as_inner())
 	}
 
 	#[inline]
@@ -187,11 +185,11 @@ impl EntryTrait for EntryStandard {
 	}
 
 	fn empty() -> Self {
-		EntryStandard(0)
+		Entry(0)
 	}
 
 	fn from_inner(inner: u64) -> Self {
-		EntryStandard(inner)
+		Entry(inner)
 	}
 
 	#[inline(always)]
@@ -577,19 +575,19 @@ mod test {
 
 	#[test]
 	fn test_entries() {
-		let mut chunk = EntryStandard::transmute_chunk(EMPTY_CHUNK);
+		let mut chunk = Entry::transmute_chunk(EMPTY_CHUNK);
 		let mut chunk2 = EMPTY_CHUNK;
-		for i in 0 .. EntryStandard::CHUNK_ENTRIES {
+		for i in 0 .. Entry::CHUNK_ENTRIES {
 			use std::collections::hash_map::DefaultHasher;
 			use std::hash::{Hash, Hasher};
 			let mut hasher = DefaultHasher::new();
 			i.hash(&mut hasher);
 			let hash = hasher.finish();
-			let entry = EntryStandard::from_inner(hash as u64);
+			let entry = Entry::from_inner(hash as u64);
 			IndexTable::write_entry(&entry, i, &mut chunk2);
 			chunk[i] = entry;
 		}
 
-		assert!(EntryStandard::transmute_chunk(chunk2) == chunk);
+		assert!(Entry::transmute_chunk(chunk2) == chunk);
 	}
 }

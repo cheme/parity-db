@@ -29,7 +29,7 @@ use crate::{
 use crate::compress::Compress;
 use crate::index::EntryTrait as _;
 
-type IndexTable = crate::index::IndexTable<crate::index::EntryStandard>;
+type IndexTable = crate::index::IndexTable<crate::index::Entry>;
 
 const START_BITS: u8 = 16;
 const MAX_REBALANCE_BATCH: u32 = 1024;
@@ -525,7 +525,7 @@ impl Column {
 						}
 						// Reconstruct as much of the original key as possible.
 						let partial_key = entry.key_material(source.id.index_bits());
-						let k = 64 - crate::index::Entry::address_bits(source.id.index_bits());
+						let k = 64 - crate::index::EntrySubCollection::address_bits(source.id.index_bits());
 						let index_key = (source_index << 64 - source.id.index_bits()) |
 							(partial_key << (64 - k - source.id.index_bits()));
 						let mut key = Key::default();
