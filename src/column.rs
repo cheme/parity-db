@@ -27,9 +27,8 @@ use crate::{
 	stats::ColumnStats,
 };
 use crate::compress::Compress;
-use crate::index::EntryTrait as _;
+use crate::index::{IndexTable, EntryTrait};
 
-type IndexTable = crate::index::IndexTable<crate::index::Entry>;
 
 const START_BITS: u8 = 16;
 const MAX_REBALANCE_BATCH: u32 = 1024;
@@ -37,19 +36,19 @@ const MAX_REBALANCE_BATCH: u32 = 1024;
 pub type ColId = u8;
 pub type Salt = [u8; 32];
 
-struct Tables {
-	index: IndexTable,
+struct Tables<E> {
+	index: IndexTable<E>,
 	value: [ValueTable; 16],
 }
 
-struct Reindex {
-	queue: VecDeque<IndexTable>,
+struct Reindex<E> {
+	queue: VecDeque<IndexTable<E>>,
 	progress: AtomicU64,
 }
 
-pub struct Column {
-	tables: RwLock<Tables>,
-	reindex: RwLock<Reindex>,
+pub struct Column<E> {
+	tables: RwLock<Tables<E>>,
+	reindex: RwLock<Reindex<E>>,
 	path: std::path::PathBuf,
 	preimage: bool,
 	uniform_keys: bool,
@@ -60,17 +59,17 @@ pub struct Column {
 	compression: Compress,
 }
 
-impl Column {
-	pub fn get(&self, key: &Key, log: &RwLock<LogOverlays>) -> Result<Option<Value>> {
+impl<E: EntryTrait> Column<E> {
+	pub fn get(&self, key: &Key, log: &RwLock<LogOverlays>, subcollection: Option<u64>) -> Result<Option<Value>> {
 		let tables = self.tables.read();
-		if let Some((tier, value)) = self.get_in_index(key, &tables.index, &*tables, log)? {
+		if let Some((tier, value)) = self.get_in_index(key, &tables.index, &*tables, log, subcollection)? {
 			if self.collect_stats {
 				self.stats.query_hit(tier);
 			}
 			return Ok(Some(value));
 		}
 		for r in &self.reindex.read().queue {
-			if let Some((tier, value)) = self.get_in_index(key, &r, &*tables, log)? {
+			if let Some((tier, value)) = self.get_in_index(key, &r, &*tables, log, subcollection)? {
 				if self.collect_stats {
 					self.stats.query_hit(tier);
 				}
@@ -83,12 +82,12 @@ impl Column {
 		Ok(None)
 	}
 
-	pub fn get_size(&self, key: &Key, log: &RwLock<LogOverlays>) -> Result<Option<u32>> {
-		self.get(key, log).map(|v| v.map(|v| v.len() as u32))
+	pub fn get_size(&self, key: &Key, log: &RwLock<LogOverlays>, subcollection: Option<u64>) -> Result<Option<u32>> {
+		self.get(key, log, subcollection).map(|v| v.map(|v| v.len() as u32))
 	}
 
-	fn get_in_index(&self, key: &Key, index: &IndexTable, tables: &Tables, log: &RwLock<LogOverlays>) -> Result<Option<(u8, Value)>> {
-		let (mut entry, mut sub_index) = index.get(key, 0, log);
+	fn get_in_index(&self, key: &Key, index: &IndexTable<E>, tables: &Tables<E>, log: &RwLock<LogOverlays>, subcollection: Option<u64>) -> Result<Option<(u8, Value)>> {
+		let (mut entry, mut sub_index) = index.get(key, 0, log, subcollection);
 		while !entry.is_empty() {
 			let size_tier = entry.address(index.id.index_bits()).size_tier() as usize;
 			match tables.value[size_tier].get(key, entry.address(index.id.index_bits()).offset(), log)? {
@@ -101,7 +100,7 @@ impl Column {
 					return Ok(Some((size_tier as u8, value)));
 				}
 				None =>  {
-					let (next_entry, next_index) = index.get(key, sub_index + 1, log);
+					let (next_entry, next_index) = index.get(key, sub_index + 1, log, subcollection);
 					entry = next_entry;
 					sub_index = next_index;
 				}
@@ -111,11 +110,11 @@ impl Column {
 	}
 
 	/// Compress if needed and return the target tier to use.
-	fn compress(&self, key: &Key, value: &[u8], tables: &Tables) -> (Option<Vec<u8>>, usize) {
+	fn compress(&self, key: &Key, value: &[u8], tables: &Tables<E>) -> (Option<Vec<u8>>, usize) {
 		Self::compress_internal(&self.compression, key, value, tables)
 	}
 
-	fn compress_internal(compression: &Compress, key: &Key, value: &[u8], tables: &Tables) -> (Option<Vec<u8>>, usize) {
+	fn compress_internal(compression: &Compress, key: &Key, value: &[u8], tables: &Tables<E>) -> (Option<Vec<u8>>, usize) {
 		let (len, result) = if value.len() > compression.treshold as usize {
 			let cvalue = compression.compress(value);
 			if cvalue.len() <= value.len() {
@@ -142,11 +141,11 @@ impl Column {
 		self.compression.decompress(buf)
 	}
 
-	pub fn open(col: ColId, options: &Options, salt: Option<Salt>) -> Result<Column> {
-		let (index, reindexing, stats) = Self::open_index(&options.path, col)?;
+	pub fn open(col: ColId, options: &Options, salt: Option<Salt>) -> Result<Column<E>> {
 		let collect_stats = options.stats;
 		let path = &options.path;
 		let options = &options.columns[col as usize];
+		let (index, reindexing, stats) = Self::open_index(path, col)?;
 		let tables = Tables {
 			index,
 			value: [
@@ -198,7 +197,7 @@ impl Column {
 		k
 	}
 
-	fn open_index(path: &std::path::Path, col: ColId) -> Result<(IndexTable, VecDeque<IndexTable>, ColumnStats)> {
+	fn open_index(path: &std::path::Path, col: ColId) -> Result<(IndexTable<E>, VecDeque<IndexTable<E>>, ColumnStats)> {
 		let mut reindexing = VecDeque::new();
 		let mut top = None;
 		let mut stats = ColumnStats::empty();
@@ -226,8 +225,8 @@ impl Column {
 	}
 
 	fn trigger_reindex(
-		tables: parking_lot::RwLockUpgradableReadGuard<Tables>,
-		reindex: parking_lot::RwLockUpgradableReadGuard<Reindex>,
+		tables: parking_lot::RwLockUpgradableReadGuard<Tables<E>>,
+		reindex: parking_lot::RwLockUpgradableReadGuard<Reindex<E>>,
 		path: &std::path::Path,
 	) {
 		let mut tables = parking_lot::RwLockUpgradableReadGuard::upgrade(tables);
@@ -247,17 +246,17 @@ impl Column {
 		reindex.queue.push_back(old_table);
 	}
 
-	pub fn write_reindex_plan(&self, key: &Key, address: Address, log: &mut LogWriter) -> Result<PlanOutcome> {
+	pub fn write_reindex_plan(&self, key: &Key, address: Address, log: &mut LogWriter, subcollection: Option<u64>) -> Result<PlanOutcome> {
 		let tables = self.tables.upgradable_read();
 		let reindex = self.reindex.upgradable_read();
-		if Self::search_index(key, &tables.index, &*tables, log)?.is_some() {
+		if Self::search_index(key, &tables.index, &*tables, log, subcollection)?.is_some() {
 			return Ok(PlanOutcome::Skipped);
 		}
-		match tables.index.write_insert_plan(key, address, None, log)? {
+		match tables.index.write_insert_plan(key, address, None, log, subcollection)? {
 			PlanOutcome::NeedReindex => {
 				log::debug!(target: "parity-db", "{}: Index chunk full {}", tables.index.id, hex(key));
 				Self::trigger_reindex(tables, reindex, self.path.as_path());
-				self.write_reindex_plan(key, address, log)?;
+				self.write_reindex_plan(key, address, log, subcollection)?;
 				return Ok(PlanOutcome::NeedReindex);
 			}
 			_ => {
@@ -268,19 +267,21 @@ impl Column {
 
 	fn search_index<'a>(
 		key: &Key,
-		index: &'a IndexTable,
-		tables: &'a Tables,
-		log: &LogWriter
-	) -> Result<Option<(&'a IndexTable, usize, u8, Address)>> {
-		let (mut existing_entry, mut sub_index) = index.get(key, 0, log);
+		index: &'a IndexTable<E>,
+		tables: &'a Tables<E>,
+		log: &LogWriter,
+		subcollection: Option<u64>,
+	) -> Result<Option<(usize, u8, Address)>> {
+	
+		let (mut existing_entry, mut sub_index) = index.get(key, 0, log, subcollection);
 		while !existing_entry.is_empty() {
 			let existing_address = existing_entry.address(index.id.index_bits());
 			let existing_tier = existing_address.size_tier();
 			if tables.value[existing_tier as usize].has_key_at(existing_address.offset(), &key, log)? {
-				return Ok(Some((&index, sub_index, existing_tier, existing_address)));
+				return Ok(Some((sub_index, existing_tier, existing_address)));
 			}
 
-			let (next_entry, next_index) = index.get(key, sub_index + 1, log);
+			let (next_entry, next_index) = index.get(key, sub_index + 1, log, subcollection);
 			existing_entry = next_entry;
 			sub_index = next_index;
 		};
@@ -289,35 +290,37 @@ impl Column {
 
 	fn search_all_indexes<'a>(
 		key: &Key,
-		tables: &'a Tables,
-		reindex: &'a Reindex,
-		log: &LogWriter
-	) -> Result<Option<(&'a IndexTable, usize, u8, Address)>> {
-			if let Some(r) = Self::search_index(key, &tables.index, tables, log)? {
+		tables: &'a Tables<E>,
+		reindex: &'a Reindex<E>,
+		log: &LogWriter,
+		subcollection: Option<u64>,
+	) -> Result<Option<(usize, u8, Address)>> {
+			if let Some(r) = Self::search_index(key, &tables.index, tables, log, subcollection)? {
 				return Ok(Some(r));
 			}
 			// Check old indexes
 			// TODO: don't search if index precedes reindex progress
 			for index in &reindex.queue {
-				if let Some(r) = Self::search_index(key, index, tables, log)? {
+				if let Some(r) = Self::search_index(key, index, tables, log, subcollection)? {
 					return Ok(Some(r));
 				}
 			}
 			Ok(None)
 	}
 
-	pub fn write_plan(&self, key: &Key, value: &Option<Value>, log: &mut LogWriter) -> Result<PlanOutcome> {
+	pub fn write_plan(&self, key: &Key, value: &Option<Value>, log: &mut LogWriter, subcollection: Option<u64>) -> Result<PlanOutcome> {
 		//TODO: return sub-chunk position in index.get
 		let tables = self.tables.upgradable_read();
 		let reindex = self.reindex.upgradable_read();
-		let existing = Self::search_all_indexes(key, &*tables, &*reindex, log)?;
+		let existing = Self::search_all_indexes(key, &*tables, &*reindex, log, subcollection)?;
 		if let &Some(ref val) = value {
 			let (cval, target_tier) = self.compress(&key, &val, &*tables);
 			let (cval, compressed) = cval.as_ref()
 				.map(|cval| (cval.as_slice(), true))
 				.unwrap_or((val.as_slice(), false));
 
-			if let Some((table, sub_index, existing_tier, existing_address)) = existing {
+			if let Some((sub_index, existing_tier, existing_address)) = existing {
+				let table = &tables.index;
 				let existing_tier = existing_tier as usize;
 				if self.collect_stats {
 					let (cur_size, compressed) = tables.value[existing_tier].size(&key, existing_address.offset(), log)?
@@ -353,17 +356,17 @@ impl Column {
 					let new_address = Address::new(new_offset, target_tier as u8);
 					// If it was found in an older index we just insert a new entry. Reindex won't overwrite it.
 					let sub_index = if table.id == tables.index.id { Some(sub_index) } else { None };
-					return tables.index.write_insert_plan(key, new_address, sub_index, log);
+					return tables.index.write_insert_plan(key, new_address, sub_index, log, subcollection);
 				}
 			} else {
 				log::trace!(target: "parity-db", "{}: Inserting new index {}", tables.index.id, hex(key));
 				let offset = tables.value[target_tier].write_insert_plan(key, &cval, log, compressed)?;
 				let address = Address::new(offset, target_tier as u8);
-				match tables.index.write_insert_plan(key, address, None, log)? {
+				match tables.index.write_insert_plan(key, address, None, log, subcollection)? {
 					PlanOutcome::NeedReindex => {
 						log::debug!(target: "parity-db", "{}: Index chunk full {}", tables.index.id, hex(key));
 						Self::trigger_reindex(tables, reindex, self.path.as_path());
-						self.write_plan(key, value, log)?;
+						self.write_plan(key, value, log, subcollection)?;
 						return Ok(PlanOutcome::NeedReindex);
 					}
 					_ => {
@@ -375,7 +378,8 @@ impl Column {
 				}
 			}
 		} else {
-			if let Some((table, sub_index, existing_tier, existing_address)) = existing {
+			let table = &tables.index;
+			if let Some((sub_index, existing_tier, existing_address)) = existing {
 				// Deletion
 				let existing_tier = existing_tier as usize;
 				let cur_size = if self.collect_stats {
@@ -501,7 +505,7 @@ impl Column {
 		self.stats.write_summary(file, tables.index.id.col());
 	}
 
-	pub fn reindex(&self, log: &Log) -> Result<(Option<IndexTableId>, Vec<(Key, Address)>)> {
+	pub fn reindex(&self, log: &Log) -> Result<(Option<IndexTableId>, Vec<(Key, Address, Option<u64>)>)> {
 		// TODO: handle overlay
 		let tables = self.tables.read();
 		let reindex = self.reindex.read();
@@ -519,13 +523,14 @@ impl Column {
 				while source_index < source.id.total_chunks() && count < MAX_REBALANCE_BATCH {
 					log::trace!(target: "parity-db", "{}: Reindexing {}", source.id, source_index);
 					let entries = source.entries(source_index, &*log.overlays());
-					for entry in entries.iter() {
+					for entry in entries.as_ref().iter() {
 						if entry.is_empty() {
 							continue;
 						}
 						// Reconstruct as much of the original key as possible.
 						let partial_key = entry.key_material(source.id.index_bits());
-						let k = 64 - crate::index::EntrySubCollection::address_bits(source.id.index_bits());
+						let subcollection = entry.subcollection();
+						let k = 64 - E::address_bits(source.id.index_bits());
 						let index_key = (source_index << 64 - source.id.index_bits()) |
 							(partial_key << (64 - k - source.id.index_bits()));
 						let mut key = Key::default();
@@ -536,7 +541,7 @@ impl Column {
 							.partial_key_at(address.offset(), &*log.overlays())? {
 							&mut key[6..].copy_from_slice(&partial_key[6..]);
 							log::trace!(target: "parity-db", "{}: Reinserting {}", source.id, hex(&key));
-							plan.push((key, entry.address(source.id.index_bits())))
+							plan.push((key, entry.address(source.id.index_bits()), subcollection))
 						} else {
 							log::error!(target: "parity-db", "Missing value for reindexing {}, {}", source.id, hex(&key));
 						}

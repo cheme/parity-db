@@ -46,13 +46,13 @@ pub struct Entry(u64);
 
 /// Entry manipulation.
 /// Trait allows multiple entry layout.
-pub trait EntryTrait {
+pub trait EntryTrait: Sized {
 	const CHUNK_ENTRIES: usize;
 	const CHUNK_ENTRIES_BITS: u8;
 	const ENTRY_LEN: u8;
 	const ENTRY_BYTES: u8;
 	type InnerRep;
-	type Entries;
+	type Entries: AsRef<[Self]>;
 
 	fn new(address: Address, key_material: u64, index_bits: u8) -> Self;
 	fn address(&self, index_bits: u8) -> Address;
@@ -64,6 +64,7 @@ pub trait EntryTrait {
 	fn transmute_chunk(chunk: [u8; CHUNK_LEN]) -> Self::Entries;
 	fn write_entry(&self, at: usize, chunk: &mut [u8; CHUNK_LEN]);
 	fn inner_from_chunk(ix: usize, chunk: &[u8]) -> Self::InnerRep;
+	fn subcollection(&self) -> Option<u64>;
 
 	#[inline]
 	fn address_bits(index_bits: u8) -> u8 {
@@ -148,6 +149,10 @@ impl EntryTrait for EntrySubCollection {
 			u64::from_le_bytes(chunk[at * Self::ENTRY_BYTES as usize + 8 .. at * Self::ENTRY_BYTES as usize + Self::ENTRY_BYTES as usize].try_into().unwrap()),
 		)
 	}
+
+	fn subcollection(&self) -> Option<u64> {
+		Some((self.0).1)
+	}
 }
 
 impl EntryTrait for Entry {
@@ -212,9 +217,11 @@ impl EntryTrait for Entry {
 	fn inner_from_chunk(at: usize, chunk: &[u8]) -> Self::InnerRep {
 		u64::from_le_bytes(chunk[at * Self::ENTRY_BYTES as usize .. at * Self::ENTRY_BYTES as usize + Self::ENTRY_BYTES as usize].try_into().unwrap())
 	}
+
+	fn subcollection(&self) -> Option<u64> {
+		None
+	}
 }
-
-
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 pub struct Address(u64);
@@ -383,13 +390,14 @@ impl<E: EntryTrait> IndexTable<E> {
 		return (E::empty(), 0)
 	}
 
-	pub fn get(&self, key: &Key, sub_index: usize, log: &impl LogQuery) -> (E, usize) {
-		log::trace!(target: "parity-db", "{}: Querying {}", self.id, hex(&key));
+	pub fn get(&self, key: &Key, sub_index: usize, log: &impl LogQuery, subcollection: Option<u64>) -> (E, usize) {
+		log::trace!(target: "parity-db", "{}: Querying {}, sub {:?}", self.id, hex(&key), subcollection);
 		let key = u64::from_be_bytes((key[0..8]).try_into().unwrap());
 		let chunk_index = self.chunk_index(key);
 
 		if let Some(entry) = log.with_index(self.id, chunk_index, |chunk| {
 				log::trace!(target: "parity-db", "{}: Querying overlay at {}", self.id, chunk_index);
+				// TODO use subcollection in find _entry
 				self.find_entry(key, sub_index, chunk)
 			}) {
 			return entry;
@@ -472,11 +480,12 @@ impl<E: EntryTrait> IndexTable<E> {
 		return Ok(PlanOutcome::NeedReindex);
 	}
 
-	pub fn write_insert_plan(&self, key: &Key, address: Address, sub_index: Option<usize>, log: &mut LogWriter) -> Result<PlanOutcome> {
+	pub fn write_insert_plan(&self, key: &Key, address: Address, sub_index: Option<usize>, log: &mut LogWriter, subcollection: Option<u64>) -> Result<PlanOutcome> {
 		log::trace!(target: "parity-db", "{}: Inserting {} -> {}", self.id, hex(&key), address);
 		let key = u64::from_be_bytes((key[0..8]).try_into().unwrap());
 		let chunk_index = self.chunk_index(key);
 
+		// TODO subcollection used here!!
 		if let Some(chunk) = log.with_index(self.id, chunk_index, |chunk| chunk.clone()) {
 			return self.plan_insert_chunk(key, address, &chunk, sub_index, log)
 		}

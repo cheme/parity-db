@@ -30,7 +30,7 @@ impl db_bench::Db for BenchAdapter {
 	}
 
 	fn commit<I: IntoIterator<Item=(db_bench::Key, Option<db_bench::Value>)>>(&self, tx: I) {
-		self.0.commit(tx.into_iter().map(|(k, v)| (0, k, v))).unwrap()
+		self.0.commit(tx.into_iter().map(|(k, v)| (0, k, v, None))).unwrap()
 	}
 }
 

@@ -38,7 +38,7 @@ use fs2::FileExt;
 use crate::{
 	table::Key,
 	error::{Error, Result},
-	column::{ColId, Column},
+	column::ColId,
 	log::{Log, LogAction},
 	index::PlanOutcome,
 	options::Options,
@@ -63,7 +63,7 @@ struct Commit {
 	// removal (keys)
 	bytes: usize,
 	// Operations.
-	changeset: Vec<(ColId, Key, Option<Value>)>,
+	changeset: Vec<(ColId, Key, Option<Value>, Option<u64>)>,
 }
 
 // Pending commits. This may not grow beyond `MAX_COMMIT_QUEUE_BYTES` bytes.
@@ -91,6 +91,20 @@ impl std::hash::Hasher for IdentityKeyHash {
 	}
 }
 
+enum Column {
+	Standard(crate::column::Column<crate::index::Entry>),
+	SubCollection(crate::column::Column<crate::index::EntrySubCollection>),
+}
+
+macro_rules! col {
+	($column: expr, $name:ident $( , $arg:expr )*) => {
+		match $column {
+			Column::Standard(c) => c.$name($($arg),*),
+			Column::SubCollection(c) => c.$name($($arg),*),
+		}
+	};
+}
+
 struct DbInner {
 	columns: Vec<Column>,
 	options: Options,
@@ -103,7 +117,7 @@ struct DbInner {
 	commit_worker_cv: Condvar,
 	commit_work: Mutex<bool>,
 	// Overlay of most recent values int the commit queue. ColumnId -> (Key -> (RecordId, Value)).
-	commit_overlay: RwLock<Vec<HashMap<Key, (u64, Option<Value>), IdentityBuildHasher>>>,
+	commit_overlay: RwLock<Vec<HashMap<(Key, Option<u64>), (u64, Option<Value>), IdentityBuildHasher>>>,
 	log_cv: Condvar,
 	log_queue_bytes: Mutex<u64>,
 	flush_worker_cv: Condvar,
@@ -128,7 +142,12 @@ impl DbInner {
 		let mut columns = Vec::with_capacity(options.columns.len());
 		let mut commit_overlay = Vec::with_capacity(options.columns.len());
 		for c in 0 .. options.columns.len() {
-			columns.push(Column::open(c as ColId, &options, salt.clone())?);
+			let column = if options.columns[c].subcollections {
+				Column::SubCollection(crate::column::Column::open(c as ColId, &options, salt.clone())?)
+			} else {
+				Column::Standard(crate::column::Column::open(c as ColId, &options, salt.clone())?)
+			};
+			columns.push(column);
 			commit_overlay.push(
 				HashMap::with_hasher(std::hash::BuildHasherDefault::<IdentityKeyHash>::default())
 			);
@@ -177,37 +196,37 @@ impl DbInner {
 		self.flush_worker_cv.notify_one();
 	}
 
-	fn get(&self, col: ColId, key: &[u8]) -> Result<Option<Value>> {
-		let key = self.columns[col as usize].hash(key);
+	fn get(&self, col: ColId, key: &[u8], subcollection: Option<u64>) -> Result<Option<Value>> {
+		let key = col!(&self.columns[col as usize], hash, key);
 		let overlay = self.commit_overlay.read();
 		// Check commit overlay first
-		if let Some(v) = overlay.get(col as usize).and_then(|o| o.get(&key).map(|(_, v)| v.clone())) {
+		if let Some(v) = overlay.get(col as usize).and_then(|o| o.get(&(key, subcollection)).map(|(_, v)| v.clone())) {
 			return Ok(v);
 		}
 		// Go into tables and log overlay.
 		let log = self.log.overlays();
-		self.columns[col as usize].get(&key, log)
+		col!(&self.columns[col as usize], get, &key, log, subcollection)
 	}
 
-	fn get_size(&self, col: ColId, key: &[u8]) -> Result<Option<u32>> {
-		let key = self.columns[col as usize].hash(key);
+	fn get_size(&self, col: ColId, key: &[u8], subcollection: Option<u64>) -> Result<Option<u32>> {
+		let key = col!(&self.columns[col as usize], hash, key);
 		let overlay = self.commit_overlay.read();
 		// Check commit overlay first
 		if let Some(l) = overlay.get(col as usize).and_then(
-			|o| o.get(&key).map(|(_, v)| v.as_ref().map(|v| v.len() as u32))
+			|o| o.get(&(key, subcollection)).map(|(_, v)| v.as_ref().map(|v| v.len() as u32))
 		) {
 			return Ok(l);
 		}
 		// Go into tables and log overlay.
 		let log = self.log.overlays();
-		self.columns[col as usize].get_size(&key, log)
+		col!(&self.columns[col as usize], get_size, &key, log, subcollection)
 	}
 
 	// Commit is simply adds the the data to the queue and to the overlay and
 	// exits as early as possible.
 	fn commit<I, K>(&self, tx: I) -> Result<()>
 		where
-			I: IntoIterator<Item=(ColId, K, Option<Value>)>,
+			I: IntoIterator<Item=(ColId, K, Option<Value>, Option<u64>)>,
 			K: AsRef<[u8]>,
 	{
 		{
@@ -218,7 +237,7 @@ impl DbInner {
 		}
 
 		let commit: Vec<_> = tx.into_iter().map(
-			|(c, k, v)| (c, self.columns[c as usize].hash(k.as_ref()), v)
+			|(c, k, v, s)| (c, col!(&self.columns[c as usize], hash, k.as_ref()), v, s)
 		).collect();
 
 		{
@@ -232,12 +251,12 @@ impl DbInner {
 			let record_id = queue.record_id + 1;
 
 			let mut bytes = 0;
-			for (c, k, v) in &commit {
+			for (c, k, v, s) in &commit {
 				bytes += k.len();
 				bytes += v.as_ref().map_or(0, |v|v.len());
 				// Don't add removed ref-counted values to overlay.
 				if !self.options.columns[*c as usize].ref_counted || v.is_some() {
-					overlay[*c as usize].insert(*k, (record_id, v.clone()));
+					overlay[*c as usize].insert((*k, *s), (record_id, v.clone()));
 				}
 			}
 
@@ -303,8 +322,8 @@ impl DbInner {
 				commit.bytes,
 			);
 			let mut ops: u64 = 0;
-			for (c, key, value) in commit.changeset.iter() {
-				match self.columns[*c as usize].write_plan(key, value, &mut writer)? {
+			for (c, key, value, s) in commit.changeset.iter() {
+				match col!(&self.columns[*c as usize], write_plan, key, value, &mut writer, *s)? {
 					// Reindex has triggered another reindex.
 					PlanOutcome::NeedReindex => {
 						reindex = true;
@@ -315,7 +334,7 @@ impl DbInner {
 			}
 			// Collect final changes to value tables
 			for c in self.columns.iter() {
-				c.complete_plan(&mut writer)?;
+				col!(c, complete_plan, &mut writer)?;
 			}
 			let record_id = writer.record_id();
 			let l = writer.drain();
@@ -331,9 +350,9 @@ impl DbInner {
 			{
 				// Cleanup the commit overlay.
 				let mut overlay = self.commit_overlay.write();
-				for (c, key, _) in commit.changeset.iter() {
+				for (c, key, _, s) in commit.changeset.iter() {
 					let overlay = &mut overlay[*c as usize];
-					if let std::collections::hash_map::Entry::Occupied(e) = overlay.entry(*key) {
+					if let std::collections::hash_map::Entry::Occupied(e) = overlay.entry((*key, *s)) {
 						if e.get().0 == commit.id {
 							e.remove_entry();
 						}
@@ -370,7 +389,7 @@ impl DbInner {
 		}
 		// Process any pending reindexes
 		for column in self.columns.iter() {
-			let (drop_index, batch) = column.reindex(&self.log)?;
+			let (drop_index, batch) = col!(column, reindex, &self.log)?;
 			if !batch.is_empty() {
 				let mut next_reindex = false;
 				let mut writer = self.log.begin_record();
@@ -379,8 +398,8 @@ impl DbInner {
 					"Creating reindex record {}",
 					writer.record_id(),
 				);
-				for (key, address) in batch.into_iter() {
-					match column.write_reindex_plan(&key, address, &mut writer)? {
+				for (key, address, s) in batch.into_iter() {
+					match col!(column, write_reindex_plan, &key, address, &mut writer, s)? {
 						PlanOutcome::NeedReindex => {
 							next_reindex = true
 						},
@@ -446,7 +465,7 @@ impl DbInner {
 							},
 							LogAction::InsertIndex(insertion) => {
 								let col = insertion.table.col() as usize;
-								if let Err(e) = self.columns[col].validate_plan(LogAction::InsertIndex(insertion), &mut reader) {
+								if let Err(e) = col!(&self.columns[col], validate_plan, LogAction::InsertIndex(insertion), &mut reader) {
 									log::warn!(target: "parity-db", "Error replaying log: {:?}. Reverting", e);
 									std::mem::drop(reader);
 									self.log.clear_logs()?;
@@ -455,7 +474,7 @@ impl DbInner {
 							},
 							LogAction::InsertValue(insertion) => {
 								let col = insertion.table.col() as usize;
-								if let Err(e) = self.columns[col].validate_plan(LogAction::InsertValue(insertion), &mut reader) {
+								if let Err(e) = col!(&self.columns[col], validate_plan, LogAction::InsertValue(insertion), &mut reader) {
 									log::warn!(target: "parity-db", "Error replaying log: {:?}. Reverting", e);
 									std::mem::drop(reader);
 									self.log.clear_logs()?;
@@ -479,13 +498,13 @@ impl DbInner {
 							break;
 						},
 						LogAction::InsertIndex(insertion) => {
-							self.columns[insertion.table.col() as usize]
-								.enact_plan(LogAction::InsertIndex(insertion), &mut reader)?;
+							col!(&self.columns[insertion.table.col() as usize],
+								enact_plan, LogAction::InsertIndex(insertion), &mut reader)?;
 
 						},
 						LogAction::InsertValue(insertion) => {
-							self.columns[insertion.table.col() as usize]
-								.enact_plan(LogAction::InsertValue(insertion), &mut reader)?;
+							col!(&self.columns[insertion.table.col() as usize],
+								enact_plan, LogAction::InsertValue(insertion), &mut reader)?;
 
 						},
 						LogAction::DropTable(id) => {
@@ -494,7 +513,7 @@ impl DbInner {
 								"Dropping index {}",
 								id,
 							);
-							self.columns[id.col() as usize].drop_index(id)?;
+							col!(&self.columns[id.col() as usize], drop_index, id)?;
 							// Check if there's another reindex on the next iteration
 							self.start_reindex(reader.record_id());
 						}
@@ -554,7 +573,7 @@ impl DbInner {
 		while self.enact_logs(true)? { }
 		// Re-read any cached metadata
 		for c in self.columns.iter() {
-			c.refresh_metadata()?;
+			col!(c, refresh_metadata)?;
 		}
 		log::debug!(target: "parity-db", "Done.");
 		Ok(())
@@ -572,7 +591,7 @@ impl DbInner {
 			match std::fs::File::create(path) {
 				Ok(file) => {
 					for c in self.columns.iter() {
-						c.write_stats(&file);
+						col!(c, write_stats, &file);
 					}
 				}
 				Err(e) => log::warn!(target: "parity-db", "Error creating stats file: {:?}", e),
@@ -632,16 +651,24 @@ impl Db {
 	}
 
 	pub fn get(&self, col: ColId, key: &[u8]) -> Result<Option<Value>> {
-		self.inner.get(col, key)
+		self.inner.get(col, key, None)
+	}
+
+	pub fn get_subcollection(&self, col: ColId, key: &[u8], subcollection: u64) -> Result<Option<Value>> {
+		self.inner.get(col, key, Some(subcollection))
 	}
 
 	pub fn get_size(&self, col: ColId, key: &[u8]) -> Result<Option<u32>> {
-		self.inner.get_size(col, key)
+		self.inner.get_size(col, key, None)
+	}
+
+	pub fn get_size_subcollection(&self, col: ColId, key: &[u8], subcollection: u64) -> Result<Option<u32>> {
+		self.inner.get_size(col, key, Some(subcollection))
 	}
 
 	pub fn commit<I, K>(&self, tx: I) -> Result<()>
 	where
-		I: IntoIterator<Item=(ColId, K, Option<Value>)>,
+		I: IntoIterator<Item=(ColId, K, Option<Value>, Option<u64>)>,
 		K: AsRef<[u8]>,
 	{
 		self.inner.commit(tx)
