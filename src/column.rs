@@ -54,22 +54,23 @@ pub struct Column<E> {
 	uniform_keys: bool,
 	collect_stats: bool,
 	ref_counted: bool,
+	subcollections: bool,
 	salt: Option<Salt>,
 	stats: ColumnStats,
 	compression: Compress,
 }
 
 impl<E: EntryTrait> Column<E> {
-	pub fn get(&self, key: &Key, log: &RwLock<LogOverlays>, subcollection: Option<u64>) -> Result<Option<Value>> {
+	pub fn get(&self, key: &Key, log: &RwLock<LogOverlays>) -> Result<Option<Value>> {
 		let tables = self.tables.read();
-		if let Some((tier, value)) = self.get_in_index(key, &tables.index, &*tables, log, subcollection)? {
+		if let Some((tier, value)) = self.get_in_index(key, &tables.index, &*tables, log)? {
 			if self.collect_stats {
 				self.stats.query_hit(tier);
 			}
 			return Ok(Some(value));
 		}
 		for r in &self.reindex.read().queue {
-			if let Some((tier, value)) = self.get_in_index(key, &r, &*tables, log, subcollection)? {
+			if let Some((tier, value)) = self.get_in_index(key, &r, &*tables, log)? {
 				if self.collect_stats {
 					self.stats.query_hit(tier);
 				}
@@ -82,12 +83,12 @@ impl<E: EntryTrait> Column<E> {
 		Ok(None)
 	}
 
-	pub fn get_size(&self, key: &Key, log: &RwLock<LogOverlays>, subcollection: Option<u64>) -> Result<Option<u32>> {
-		self.get(key, log, subcollection).map(|v| v.map(|v| v.len() as u32))
+	pub fn get_size(&self, key: &Key, log: &RwLock<LogOverlays>) -> Result<Option<u32>> {
+		self.get(key, log).map(|v| v.map(|v| v.len() as u32))
 	}
 
-	fn get_in_index(&self, key: &Key, index: &IndexTable<E>, tables: &Tables<E>, log: &RwLock<LogOverlays>, subcollection: Option<u64>) -> Result<Option<(u8, Value)>> {
-		let (mut entry, mut sub_index) = index.get(key, 0, log, subcollection);
+	fn get_in_index(&self, key: &Key, index: &IndexTable<E>, tables: &Tables<E>, log: &RwLock<LogOverlays>) -> Result<Option<(u8, Value)>> {
+		let (mut entry, mut sub_index) = index.get(key, 0, log);
 		while !entry.is_empty() {
 			let size_tier = entry.address(index.id.index_bits()).size_tier() as usize;
 			match tables.value[size_tier].get(key, entry.address(index.id.index_bits()).offset(), log)? {
@@ -100,7 +101,7 @@ impl<E: EntryTrait> Column<E> {
 					return Ok(Some((size_tier as u8, value)));
 				}
 				None =>  {
-					let (next_entry, next_index) = index.get(key, sub_index + 1, log, subcollection);
+					let (next_entry, next_index) = index.get(key, sub_index + 1, log);
 					entry = next_entry;
 					sub_index = next_index;
 				}
@@ -178,6 +179,7 @@ impl<E: EntryTrait> Column<E> {
 			preimage: options.preimage,
 			uniform_keys: options.uniform,
 			ref_counted: options.ref_counted,
+			subcollections: options.subcollections,
 			collect_stats,
 			salt,
 			stats,
@@ -185,14 +187,33 @@ impl<E: EntryTrait> Column<E> {
 		})
 	}
 
-	pub fn hash(&self, key: &[u8]) -> Key {
+	pub fn hash(&self, key: &[u8], subcollection: Option<u64>) -> Key {
 		let mut k = Key::default();
 		if self.uniform_keys {
 			k.copy_from_slice(&key[0..32]);
-		} else if let Some(salt) = &self.salt {
-			k.copy_from_slice(blake2_rfc::blake2b::blake2b(32, &salt[..], &key).as_bytes());
 		} else {
-			k.copy_from_slice(blake2_rfc::blake2b::blake2b(32, &[], &key).as_bytes());
+			let salt = if let Some(salt) = &self.salt {
+				&salt[..]
+			} else {
+				&[]
+			};
+			if let Some(subcollection) = subcollection {
+				if !self.subcollections {
+					panic!("Subcollection unsupported for this column");
+				}
+
+				if self.ref_counted {
+					// share value (usually uses directly uniform_keys)
+					k.copy_from_slice(blake2_rfc::blake2b::blake2b(32, &salt[..], &key).as_bytes());
+				} else {
+					let mut blake = blake2_rfc::blake2b::Blake2b::with_key(32, &salt[..]);
+					blake.update(&subcollection.to_le_bytes()[..]);
+					blake.update(&key);
+					k.copy_from_slice(blake.finalize().as_bytes())
+				}
+			} else {
+				k.copy_from_slice(blake2_rfc::blake2b::blake2b(32, &salt[..], &key).as_bytes());
+			}
 		}
 		k
 	}
@@ -249,7 +270,7 @@ impl<E: EntryTrait> Column<E> {
 	pub fn write_reindex_plan(&self, key: &Key, address: Address, log: &mut LogWriter, subcollection: Option<u64>) -> Result<PlanOutcome> {
 		let tables = self.tables.upgradable_read();
 		let reindex = self.reindex.upgradable_read();
-		if Self::search_index(key, &tables.index, &*tables, log, subcollection)?.is_some() {
+		if Self::search_index(key, &tables.index, &*tables, log)?.is_some() {
 			return Ok(PlanOutcome::Skipped);
 		}
 		match tables.index.write_insert_plan(key, address, None, log, subcollection)? {
@@ -270,10 +291,9 @@ impl<E: EntryTrait> Column<E> {
 		index: &'a IndexTable<E>,
 		tables: &'a Tables<E>,
 		log: &LogWriter,
-		subcollection: Option<u64>,
 	) -> Result<Option<(usize, u8, Address)>> {
 	
-		let (mut existing_entry, mut sub_index) = index.get(key, 0, log, subcollection);
+		let (mut existing_entry, mut sub_index) = index.get(key, 0, log);
 		while !existing_entry.is_empty() {
 			let existing_address = existing_entry.address(index.id.index_bits());
 			let existing_tier = existing_address.size_tier();
@@ -281,7 +301,7 @@ impl<E: EntryTrait> Column<E> {
 				return Ok(Some((sub_index, existing_tier, existing_address)));
 			}
 
-			let (next_entry, next_index) = index.get(key, sub_index + 1, log, subcollection);
+			let (next_entry, next_index) = index.get(key, sub_index + 1, log);
 			existing_entry = next_entry;
 			sub_index = next_index;
 		};
@@ -293,15 +313,14 @@ impl<E: EntryTrait> Column<E> {
 		tables: &'a Tables<E>,
 		reindex: &'a Reindex<E>,
 		log: &LogWriter,
-		subcollection: Option<u64>,
 	) -> Result<Option<(usize, u8, Address)>> {
-			if let Some(r) = Self::search_index(key, &tables.index, tables, log, subcollection)? {
+			if let Some(r) = Self::search_index(key, &tables.index, tables, log)? {
 				return Ok(Some(r));
 			}
 			// Check old indexes
 			// TODO: don't search if index precedes reindex progress
 			for index in &reindex.queue {
-				if let Some(r) = Self::search_index(key, index, tables, log, subcollection)? {
+				if let Some(r) = Self::search_index(key, index, tables, log)? {
 					return Ok(Some(r));
 				}
 			}
@@ -312,7 +331,7 @@ impl<E: EntryTrait> Column<E> {
 		//TODO: return sub-chunk position in index.get
 		let tables = self.tables.upgradable_read();
 		let reindex = self.reindex.upgradable_read();
-		let existing = Self::search_all_indexes(key, &*tables, &*reindex, log, subcollection)?;
+		let existing = Self::search_all_indexes(key, &*tables, &*reindex, log)?;
 		if let &Some(ref val) = value {
 			let (cval, target_tier) = self.compress(&key, &val, &*tables);
 			let (cval, compressed) = cval.as_ref()

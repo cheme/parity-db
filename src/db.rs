@@ -117,7 +117,7 @@ struct DbInner {
 	commit_worker_cv: Condvar,
 	commit_work: Mutex<bool>,
 	// Overlay of most recent values int the commit queue. ColumnId -> (Key -> (RecordId, Value)).
-	commit_overlay: RwLock<Vec<HashMap<(Key, Option<u64>), (u64, Option<Value>), IdentityBuildHasher>>>,
+	commit_overlay: RwLock<Vec<HashMap<Key, (u64, Option<Value>, Option<u64>), IdentityBuildHasher>>>,
 	log_cv: Condvar,
 	log_queue_bytes: Mutex<u64>,
 	flush_worker_cv: Condvar,
@@ -197,29 +197,29 @@ impl DbInner {
 	}
 
 	fn get(&self, col: ColId, key: &[u8], subcollection: Option<u64>) -> Result<Option<Value>> {
-		let key = col!(&self.columns[col as usize], hash, key);
+		let key = col!(&self.columns[col as usize], hash, key, subcollection);
 		let overlay = self.commit_overlay.read();
 		// Check commit overlay first
-		if let Some(v) = overlay.get(col as usize).and_then(|o| o.get(&(key, subcollection)).map(|(_, v)| v.clone())) {
+		if let Some(v) = overlay.get(col as usize).and_then(|o| o.get(&key).map(|(_, v, _)| v.clone())) {
 			return Ok(v);
 		}
 		// Go into tables and log overlay.
 		let log = self.log.overlays();
-		col!(&self.columns[col as usize], get, &key, log, subcollection)
+		col!(&self.columns[col as usize], get, &key, log)
 	}
 
 	fn get_size(&self, col: ColId, key: &[u8], subcollection: Option<u64>) -> Result<Option<u32>> {
-		let key = col!(&self.columns[col as usize], hash, key);
+		let key = col!(&self.columns[col as usize], hash, key, subcollection);
 		let overlay = self.commit_overlay.read();
 		// Check commit overlay first
 		if let Some(l) = overlay.get(col as usize).and_then(
-			|o| o.get(&(key, subcollection)).map(|(_, v)| v.as_ref().map(|v| v.len() as u32))
+			|o| o.get(&key).map(|(_, v, _)| v.as_ref().map(|v| v.len() as u32))
 		) {
 			return Ok(l);
 		}
 		// Go into tables and log overlay.
 		let log = self.log.overlays();
-		col!(&self.columns[col as usize], get_size, &key, log, subcollection)
+		col!(&self.columns[col as usize], get_size, &key, log)
 	}
 
 	// Commit is simply adds the the data to the queue and to the overlay and
@@ -237,7 +237,7 @@ impl DbInner {
 		}
 
 		let commit: Vec<_> = tx.into_iter().map(
-			|(c, k, v, s)| (c, col!(&self.columns[c as usize], hash, k.as_ref()), v, s)
+			|(c, k, v, s)| (c, col!(&self.columns[c as usize], hash, k.as_ref(), s), v, s)
 		).collect();
 
 		{
@@ -256,7 +256,7 @@ impl DbInner {
 				bytes += v.as_ref().map_or(0, |v|v.len());
 				// Don't add removed ref-counted values to overlay.
 				if !self.options.columns[*c as usize].ref_counted || v.is_some() {
-					overlay[*c as usize].insert((*k, *s), (record_id, v.clone()));
+					overlay[*c as usize].insert(*k, (record_id, v.clone(), *s));
 				}
 			}
 
@@ -350,9 +350,9 @@ impl DbInner {
 			{
 				// Cleanup the commit overlay.
 				let mut overlay = self.commit_overlay.write();
-				for (c, key, _, s) in commit.changeset.iter() {
+				for (c, key, _, _) in commit.changeset.iter() {
 					let overlay = &mut overlay[*c as usize];
-					if let std::collections::hash_map::Entry::Occupied(e) = overlay.entry((*key, *s)) {
+					if let std::collections::hash_map::Entry::Occupied(e) = overlay.entry(*key) {
 						if e.get().0 == commit.id {
 							e.remove_entry();
 						}
