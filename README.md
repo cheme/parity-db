@@ -38,6 +38,71 @@ Value table is linear array of fixed-size entries that can grow as necessary. Ea
 
 15 of 16 value tables only allow values up to entry size. An additional table with 8kb entry size is designated for large values and allows multipart entries.
 
+### Subcollection
+
+Subcollection are defined as an available u64.
+
+They allow bach deletion.
+
+Removal is done asynchronously by the reindexing process.
+
+Removal involve iterating all index. Current implementation consider a subcollection index should not be reuse and lock in case of reuse.
+
+u64 may seem too small, TODO could consider u64 being hash(&[u8]) to get any subcollection and add remaining subcollection hash with value (next to key).
+
+#### Subcollection no Rc
+
+Index key is calculated from hashing both key and subcollection.
+
+So it is basically the same as using a key build from both key and subcollection.
+
+Only difference is that index does contain the subcollection in its entry (index entry size * 2).
+
+Therefore we can on asynchronous removal, iterate all index entry and check quickly the subcollection.
+
+#### Subcollection with Rc (ko design)
+
+Here index key is calculated the same way as usual (using only the key).
+
+So all subcollection identical key will use same index entry and point to same value.
+
+Pb:
+
+- index entry needs ALL subcollection for its removal process.
+- Rc needs to be manage by subcollection: otherwhise removal will be invalid (we don't know how many should be remove).
+
+#### Subcollection with Rc (better design?)
+
+Store a bloom filter of all subcollection instead of subcollection.
+
+Put `Vec<(SubCollectionId, SubCollectionRc)> attached to value.
+
+Issue no way to make this value attached map efficient.
+
+#### Subcollection with Rc (better design?)
+
+Therefore we need index (key + subcollection) that contains a single subcollection id and a Rc.
+(could reduce the subcollection to u32 and store 31 bit index on entry of 128bit as in previous).
+
+Also need a index (key only) containing a column global indexing (same as no collection).
+
+Then Rc act as normal in value.
+
+`get` operation is done on first index.
+
+`add` operation run on second index, then create/update first index from 
+
+`remove` operation run on first index, and on second.
+
+So update are runing a double indexing scheme.
+
+Reads are runing a simple index query (but on a a bigger index).
+
+#### Subcollection with Rc (better design?)
+
+First level indexing of subcollection.
+Then sharing Rc does not work.
+
 ## Operations
 
 ### Lookup

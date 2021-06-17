@@ -207,6 +207,9 @@ impl DbInner {
 		let mut commit_overlay = Vec::with_capacity(options.columns.len());
 		for c in 0 .. options.columns.len() {
 			let column = if options.columns[c].subcollections {
+				if options.columns[c].ref_counted {
+					unimplemented!("TODO current implementation do not manage correctly rc for subcollection: see other desing in README");
+				}
 				Column::SubCollection(crate::column::Column::open(c as ColId, &options, salt.clone())?)
 			} else {
 				Column::Standard(crate::column::Column::open(c as ColId, &options, salt.clone())?)
