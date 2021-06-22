@@ -477,10 +477,11 @@ impl Log {
 		Ok(bytes)
 	}
 
-	// TODO add to !fast_worker
 	pub fn sync_appending(&self) -> Result<()> {
-		let mut appending = self.appending.write();
-		appending.file.get_mut().sync_data()?;
+		if self.sync {
+			let mut appending = self.appending.write();
+			appending.file.get_mut().sync_data()?;
+		}
 		Ok(())
 	}
 
