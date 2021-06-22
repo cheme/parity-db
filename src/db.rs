@@ -161,6 +161,8 @@ impl DbInner {
 		})
 	}
 
+	// TODO make it indexing only if
+	// removing fast.
 	fn signal_log_worker(&self) {
 		let mut work = self.log_work.lock();
 		*work = true;
@@ -234,12 +236,15 @@ impl DbInner {
 			let record_id = queue.record_id + 1;
 
 			let mut bytes = 0;
-			for (c, k, v) in &commit {
-				bytes += k.len();
-				bytes += v.as_ref().map_or(0, |v|v.len());
-				// Don't add removed ref-counted values to overlay.
-				if !self.options.columns[*c as usize].ref_counted || v.is_some() {
-					overlay[*c as usize].insert(*k, (record_id, v.clone()));
+
+			if self.fast_worker {
+				for (c, k, v) in &commit {
+					bytes += k.len();
+					bytes += v.as_ref().map_or(0, |v|v.len());
+					// Don't add removed ref-counted values to overlay.
+					if !self.options.columns[*c as usize].ref_counted || v.is_some() {
+						overlay[*c as usize].insert(*k, (record_id, v.clone()));
+					}
 				}
 			}
 
@@ -291,11 +296,13 @@ impl DbInner {
 					let mut logged_bytes = self.log_queue_bytes.lock();
 					let bytes = self.log.end_record(l)?;
 					*logged_bytes += bytes;
+
 					self.signal_flush_worker();
 					bytes
 				};
+				//self.log.sync_appending()?;
 
-				{
+				/*{
 					// Cleanup the commit overlay.
 					for (c, key, _) in commit.changeset.iter() {
 						let overlay = &mut overlay[*c as usize];
@@ -305,9 +312,10 @@ impl DbInner {
 							}
 						}
 					}
-				}
+				}*/
 				if reindex {
 					self.start_reindex(record_id);
+					self.signal_log_worker();
 				}
 				log::debug!(
 					target: "parity-db",
