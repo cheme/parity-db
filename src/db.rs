@@ -113,6 +113,7 @@ struct DbInner {
 	next_reindex: AtomicU64,
 	collect_stats: bool,
 	bg_err: Mutex<Option<Arc<Error>>>,
+	fast_worker: bool,
 	_lock_file: std::fs::File,
 }
 
@@ -155,6 +156,7 @@ impl DbInner {
 			last_enacted: AtomicU64::new(1),
 			collect_stats: options.stats,
 			bg_err: Mutex::new(None),
+			fast_worker: false,
 			_lock_file: lock_file,
 		})
 	}
@@ -253,9 +255,69 @@ impl DbInner {
 				commit.id,
 				bytes,
 			);
-			queue.commits.push_back(commit);
-			queue.bytes += bytes;
-			self.signal_log_worker();
+			if self.fast_worker {
+				queue.commits.push_back(commit);
+				queue.bytes += bytes;
+				self.signal_log_worker();
+			} else {
+				let mut writer = self.log.begin_record();
+				log::debug!(
+					target: "parity-db",
+					"Processing commit {}, record {}, {} bytes",
+					commit.id,
+					writer.record_id(),
+					commit.bytes,
+				);
+				let mut ops: u64 = 0;
+				let mut reindex = false;
+				for (c, key, value) in commit.changeset.iter() {
+					match self.columns[*c as usize].write_plan(key, value, &mut writer)? {
+						// Reindex has triggered another reindex.
+						PlanOutcome::NeedReindex => {
+							reindex = true;
+						},
+						_ => {},
+					}
+					ops += 1;
+				}
+				// Collect final changes to value tables
+				for c in self.columns.iter() {
+					c.complete_plan(&mut writer)?;
+				}
+				let record_id = writer.record_id();
+				let l = writer.drain();
+
+				let bytes = {
+					let mut logged_bytes = self.log_queue_bytes.lock();
+					let bytes = self.log.end_record(l)?;
+					*logged_bytes += bytes;
+					self.signal_flush_worker();
+					bytes
+				};
+
+				{
+					// Cleanup the commit overlay.
+					for (c, key, _) in commit.changeset.iter() {
+						let overlay = &mut overlay[*c as usize];
+						if let std::collections::hash_map::Entry::Occupied(e) = overlay.entry(*key) {
+							if e.get().0 == commit.id {
+								e.remove_entry();
+							}
+						}
+					}
+				}
+				if reindex {
+					self.start_reindex(record_id);
+				}
+				log::debug!(
+					target: "parity-db",
+					"Processed commit {} (record {}), {} ops, {} bytes written",
+					commit.id,
+					record_id,
+					ops,
+					bytes,
+				);
+			}
 		}
 		Ok(())
 	}
@@ -329,7 +391,8 @@ impl DbInner {
 			};
 
 			{
-				// Cleanup the commit overlay.
+				// Cleanup the commit overlay. ???? should only clear when db written?? only flush worker
+				// here.
 				let mut overlay = self.commit_overlay.write();
 				for (c, key, _) in commit.changeset.iter() {
 					let overlay = &mut overlay[*c as usize];

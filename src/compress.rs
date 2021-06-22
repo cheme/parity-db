@@ -149,15 +149,19 @@ mod snappy {
 
 		pub(super) fn compress(&self, value: &[u8]) -> Vec<u8> {
 			let mut buf = Vec::with_capacity(value.len() << 3);
-			let mut encoder = snap::write::FrameEncoder::new(&mut buf);
-			encoder.write(value).expect("Expect in memory write to succeed.");
+			{
+				let mut encoder = snap::write::FrameEncoder::new(&mut buf);
+				encoder.write(value).expect("Expect in memory write to succeed.");
+			}
 			buf
 		}
 
 		pub(super) fn decompress(&self, value: &[u8]) -> Vec<u8> {
 			let mut buf = Vec::with_capacity(value.len());
-			let mut decoder = snap::read::FrameDecoder::new(value);
-			decoder.read_to_end(&mut buf).expect("Compression corrupted.");
+			{
+				let mut decoder = snap::read::FrameDecoder::new(value);
+				decoder.read_to_end(&mut buf).expect("Compression corrupted.");
+			}
 			buf
 		}
 	}
