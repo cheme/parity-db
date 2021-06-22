@@ -183,10 +183,12 @@ impl DbInner {
 
 	fn get(&self, col: ColId, key: &[u8]) -> Result<Option<Value>> {
 		let key = self.columns[col as usize].hash(key);
-		let overlay = self.commit_overlay.read();
-		// Check commit overlay first
-		if let Some(v) = overlay.get(col as usize).and_then(|o| o.get(&key).map(|(_, v)| v.clone())) {
-			return Ok(v);
+		if self.fast_worker {
+			let overlay = self.commit_overlay.read();
+			// Check commit overlay first
+			if let Some(v) = overlay.get(col as usize).and_then(|o| o.get(&key).map(|(_, v)| v.clone())) {
+				return Ok(v);
+			}
 		}
 		// Go into tables and log overlay.
 		let log = self.log.overlays();
@@ -195,12 +197,14 @@ impl DbInner {
 
 	fn get_size(&self, col: ColId, key: &[u8]) -> Result<Option<u32>> {
 		let key = self.columns[col as usize].hash(key);
-		let overlay = self.commit_overlay.read();
-		// Check commit overlay first
-		if let Some(l) = overlay.get(col as usize).and_then(
-			|o| o.get(&key).map(|(_, v)| v.as_ref().map(|v| v.len() as u32))
-		) {
-			return Ok(l);
+		if self.fast_worker {
+			let overlay = self.commit_overlay.read();
+			// Check commit overlay first
+			if let Some(l) = overlay.get(col as usize).and_then(
+				|o| o.get(&key).map(|(_, v)| v.as_ref().map(|v| v.len() as u32))
+			) {
+				return Ok(l);
+			}
 		}
 		// Go into tables and log overlay.
 		let log = self.log.overlays();
@@ -221,23 +225,26 @@ impl DbInner {
 			}
 		}
 
-		let commit: Vec<_> = tx.into_iter().map(
+		let changeset = tx.into_iter().map(
 			|(c, k, v)| (c, self.columns[c as usize].hash(k.as_ref()), v)
-		).collect();
-
+		);
 		{
-			let mut queue = self.commit_queue.lock();
-			if queue.bytes > MAX_COMMIT_QUEUE_BYTES {
-				self.commit_queue_full_cv.wait(&mut queue);
-			}
-			let mut overlay = self.commit_overlay.write();
-
-			queue.record_id += 1;
-			let record_id = queue.record_id + 1;
-
-			let mut bytes = 0;
-
 			if self.fast_worker {
+				let commit: Vec<_> = changeset.collect();
+
+
+				let mut queue = self.commit_queue.lock();
+				if queue.bytes > MAX_COMMIT_QUEUE_BYTES {
+					self.commit_queue_full_cv.wait(&mut queue);
+				}
+				queue.record_id += 1;
+				let record_id = queue.record_id + 1;
+
+				let mut bytes = 0;
+
+
+				let mut overlay = self.commit_overlay.write();
+
 				for (c, k, v) in &commit {
 					bytes += k.len();
 					bytes += v.as_ref().map_or(0, |v|v.len());
@@ -246,21 +253,19 @@ impl DbInner {
 						overlay[*c as usize].insert(*k, (record_id, v.clone()));
 					}
 				}
-			}
 
-			let commit = Commit {
-				id: record_id,
-				changeset: commit,
-				bytes,
-			};
+				let commit = Commit {
+					id: record_id,
+					changeset: commit,
+					bytes,
+				};
 
-			log::debug!(
-				target: "parity-db",
-				"Queued commit {}, {} bytes",
-				commit.id,
-				bytes,
-			);
-			if self.fast_worker {
+				log::debug!(
+					target: "parity-db",
+					"Queued commit {}, {} bytes",
+					commit.id,
+					bytes,
+				);
 				queue.commits.push_back(commit);
 				queue.bytes += bytes;
 				self.signal_log_worker();
@@ -268,15 +273,14 @@ impl DbInner {
 				let mut writer = self.log.begin_record();
 				log::debug!(
 					target: "parity-db",
-					"Processing commit {}, record {}, {} bytes",
-					commit.id,
+					"Processing commit record {}",
 					writer.record_id(),
-					commit.bytes,
 				);
 				let mut ops: u64 = 0;
 				let mut reindex = false;
-				for (c, key, value) in commit.changeset.iter() {
-					match self.columns[*c as usize].write_plan(key, value, &mut writer)? {
+				for (c, key, value) in changeset {
+					// TODO write_plan passing by value.
+					match self.columns[c as usize].write_plan(&key, &value, &mut writer)? {
 						// Reindex has triggered another reindex.
 						PlanOutcome::NeedReindex => {
 							reindex = true;
@@ -302,25 +306,13 @@ impl DbInner {
 				};
 				//self.log.sync_appending()?;
 
-				/*{
-					// Cleanup the commit overlay.
-					for (c, key, _) in commit.changeset.iter() {
-						let overlay = &mut overlay[*c as usize];
-						if let std::collections::hash_map::Entry::Occupied(e) = overlay.entry(*key) {
-							if e.get().0 == commit.id {
-								e.remove_entry();
-							}
-						}
-					}
-				}*/
 				if reindex {
 					self.start_reindex(record_id);
 					self.signal_log_worker();
 				}
 				log::debug!(
 					target: "parity-db",
-					"Processed commit {} (record {}), {} ops, {} bytes written",
-					commit.id,
+					"Processed commit (record {}), {} ops, {} bytes written",
 					record_id,
 					ops,
 					bytes,
@@ -399,8 +391,7 @@ impl DbInner {
 			};
 
 			{
-				// Cleanup the commit overlay. ???? should only clear when db written?? only flush worker
-				// here.
+				// Cleanup the commit overlay.
 				let mut overlay = self.commit_overlay.write();
 				for (c, key, _) in commit.changeset.iter() {
 					let overlay = &mut overlay[*c as usize];
@@ -691,8 +682,9 @@ impl Db {
 			flush_worker_db.store_err(Self::flush_worker(flush_worker_db.clone()))
 		);
 		let log_worker_db = db.clone();
+		let fast_worker = db.fast_worker;
 		let log_thread = std::thread::spawn(move ||
-			log_worker_db.store_err(Self::log_worker(log_worker_db.clone()))
+			log_worker_db.store_err(Self::log_worker(log_worker_db.clone(), fast_worker))
 		);
 		Ok(Db {
 			inner: db,
@@ -739,7 +731,7 @@ impl Db {
 		Ok(())
 	}
 
-	fn log_worker(db: Arc<DbInner>) -> Result<()> {
+	fn log_worker(db: Arc<DbInner>, fast_worker: bool) -> Result<()> {
 		// Start with pending reindex.
 		let mut more_work = db.process_reindex()?;
 		while !db.shutdown.load(Ordering::SeqCst) {
@@ -751,7 +743,11 @@ impl Db {
 				*work = false;
 			}
 
-			let more_commits = db.process_commits()?;
+			let more_commits = if fast_worker {
+				db.process_commits()?
+			} else {
+				false
+			};
 			let more_reindex = db.process_reindex()?;
 			more_work = more_commits || more_reindex;
 		}

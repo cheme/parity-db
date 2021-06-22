@@ -158,10 +158,8 @@ mod snappy {
 
 		pub(super) fn decompress(&self, value: &[u8]) -> Vec<u8> {
 			let mut buf = Vec::with_capacity(value.len());
-			{
-				let mut decoder = snap::read::FrameDecoder::new(value);
-				decoder.read_to_end(&mut buf).expect("Compression corrupted.");
-			}
+			let mut decoder = snap::read::FrameDecoder::new(value);
+			decoder.read_to_end(&mut buf).expect("Compression corrupted.");
 			buf
 		}
 	}
