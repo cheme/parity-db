@@ -477,6 +477,14 @@ impl Log {
 		Ok(bytes)
 	}
 
+	pub fn sync_appending(&self) -> Result<()> {
+		/*if self.sync {
+			let mut appending = self.appending.write();
+			appending.file.get_mut().sync_data()?;
+		}*/
+		Ok(())
+	}
+
 	pub fn end_read(&self, cleared: Cleared, record_id: u64) {
 		if record_id >= self.next_record_id.load(Ordering::Relaxed) {
 			self.next_record_id.store(record_id + 1, Ordering::Relaxed);
