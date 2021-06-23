@@ -449,6 +449,13 @@ impl IndexTable {
 		log::debug!(target: "parity-db", "{}: Dropped table", self.id);
 		Ok(())
 	}
+
+	pub fn flush(&self) -> Result<()> {
+		if let Some(map) = &*self.map.read() {
+			map.flush()?;
+		}
+		Ok(())
+	}
 }
 
 #[cfg(test)]
