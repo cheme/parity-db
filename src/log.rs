@@ -395,7 +395,7 @@ impl Log {
 			}),
 			next_record_id: AtomicU64::new(1),
 			dirty: AtomicBool::new(true),
-			sync: options.sync,
+			sync: false,
 		})
 	}
 
