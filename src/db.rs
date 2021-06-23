@@ -113,6 +113,7 @@ struct DbInner {
 	next_reindex: AtomicU64,
 	collect_stats: bool,
 	bg_err: Mutex<Option<Arc<Error>>>,
+	fast_worker: bool,
 	_lock_file: std::fs::File,
 }
 
@@ -155,6 +156,7 @@ impl DbInner {
 			last_enacted: AtomicU64::new(1),
 			collect_stats: options.stats,
 			bg_err: Mutex::new(None),
+			fast_worker: false,
 			_lock_file: lock_file,
 		})
 	}
@@ -179,10 +181,12 @@ impl DbInner {
 
 	fn get(&self, col: ColId, key: &[u8]) -> Result<Option<Value>> {
 		let key = self.columns[col as usize].hash(key);
-		let overlay = self.commit_overlay.read();
-		// Check commit overlay first
-		if let Some(v) = overlay.get(col as usize).and_then(|o| o.get(&key).map(|(_, v)| v.clone())) {
-			return Ok(v);
+		if self.fast_worker {
+			let overlay = self.commit_overlay.read();
+			// Check commit overlay first
+			if let Some(v) = overlay.get(col as usize).and_then(|o| o.get(&key).map(|(_, v)| v.clone())) {
+				return Ok(v);
+			}
 		}
 		// Go into tables and log overlay.
 		let log = self.log.overlays();
@@ -191,12 +195,14 @@ impl DbInner {
 
 	fn get_size(&self, col: ColId, key: &[u8]) -> Result<Option<u32>> {
 		let key = self.columns[col as usize].hash(key);
-		let overlay = self.commit_overlay.read();
-		// Check commit overlay first
-		if let Some(l) = overlay.get(col as usize).and_then(
-			|o| o.get(&key).map(|(_, v)| v.as_ref().map(|v| v.len() as u32))
-		) {
-			return Ok(l);
+		if self.fast_worker {
+			let overlay = self.commit_overlay.read();
+			// Check commit overlay first
+			if let Some(l) = overlay.get(col as usize).and_then(
+				|o| o.get(&key).map(|(_, v)| v.as_ref().map(|v| v.len() as u32))
+			) {
+				return Ok(l);
+			}
 		}
 		// Go into tables and log overlay.
 		let log = self.log.overlays();
@@ -217,11 +223,11 @@ impl DbInner {
 			}
 		}
 
-		let commit: Vec<_> = tx.into_iter().map(
+		let changeset = tx.into_iter().map(
 			|(c, k, v)| (c, self.columns[c as usize].hash(k.as_ref()), v)
-		).collect();
-
-		{
+		);
+		if self.fast_worker {
+			let commit: Vec<_> = changeset.collect();
 			let mut queue = self.commit_queue.lock();
 			if queue.bytes > MAX_COMMIT_QUEUE_BYTES {
 				self.commit_queue_full_cv.wait(&mut queue);
@@ -256,6 +262,54 @@ impl DbInner {
 			queue.commits.push_back(commit);
 			queue.bytes += bytes;
 			self.signal_log_worker();
+		} else {
+			let mut writer = self.log.begin_record();
+			log::debug!(
+				target: "parity-db",
+				"Processing commit record {}",
+				writer.record_id(),
+			);
+			let mut ops: u64 = 0;
+			let mut reindex = false;
+			for (c, key, value) in changeset {
+				// TODO write_plan passing by value.
+				match self.columns[c as usize].write_plan(&key, &value, &mut writer)? {
+					// Reindex has triggered another reindex.
+					PlanOutcome::NeedReindex => {
+						reindex = true;
+					},
+					_ => {},
+				}
+				ops += 1;
+			}
+			// Collect final changes to value tables
+			for c in self.columns.iter() {
+				c.complete_plan(&mut writer)?;
+			}
+			let record_id = writer.record_id();
+			let l = writer.drain();
+
+			let bytes = {
+				let mut logged_bytes = self.log_queue_bytes.lock();
+				let bytes = self.log.end_record(l)?;
+				*logged_bytes += bytes;
+
+				self.signal_flush_worker();
+				bytes
+			};
+			self.log.sync_appending()?;
+
+			if reindex {
+				self.start_reindex(record_id);
+				self.signal_log_worker();
+			}
+			log::debug!(
+				target: "parity-db",
+				"Processed commit (record {}), {} ops, {} bytes written",
+				record_id,
+				ops,
+				bytes,
+			);
 		}
 		Ok(())
 	}
@@ -625,8 +679,9 @@ impl Db {
 			flush_worker_db.store_err(Self::flush_worker(flush_worker_db.clone()))
 		);
 		let log_worker_db = db.clone();
+		let fast_worker = db.fast_worker;
 		let log_thread = std::thread::spawn(move ||
-			log_worker_db.store_err(Self::log_worker(log_worker_db.clone()))
+			log_worker_db.store_err(Self::log_worker(log_worker_db.clone(), fast_worker))
 		);
 		Ok(Db {
 			inner: db,
@@ -673,7 +728,7 @@ impl Db {
 		Ok(())
 	}
 
-	fn log_worker(db: Arc<DbInner>) -> Result<()> {
+	fn log_worker(db: Arc<DbInner>, fast_worker: bool) -> Result<()> {
 		// Start with pending reindex.
 		let mut more_work = db.process_reindex()?;
 		while !db.shutdown.load(Ordering::SeqCst) {
@@ -685,7 +740,11 @@ impl Db {
 				*work = false;
 			}
 
-			let more_commits = db.process_commits()?;
+			let more_commits = if fast_worker {
+				db.process_commits()?
+			} else {
+				false
+			};
 			let more_reindex = db.process_reindex()?;
 			more_work = more_commits || more_reindex;
 		}
