@@ -31,12 +31,9 @@
 /// there is some work to be done.
 
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
-use std::convert::TryInto;
-use std::collections::{HashMap, VecDeque};
-use parking_lot::{RwLock, Mutex, Condvar};
+use parking_lot::{Mutex, Condvar};
 use fs2::FileExt;
 use crate::{
-	table::Key,
 	error::{Error, Result},
 	column::{ColId, Column},
 	log::{Log, LogAction},
@@ -44,66 +41,21 @@ use crate::{
 	options::Options,
 };
 
-// These are in memory, so we use usize
-const MAX_COMMIT_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 // These are disk-backed, so we use u64
 const MAX_LOG_QUEUE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Value is just a vector of bytes. Value sizes up to 4Gb are allowed.
 pub type Value = Vec<u8>;
 
-
-// Commit data passed to `commit`
-#[derive(Default)]
-struct Commit {
-	// Commit ID. This is not the same as log record id, as some records
-	// are originated within the DB. E.g. reindex.
-	id: u64,
-	// Size of user data pending insertion (keys + values) or
-	// removal (keys)
-	bytes: usize,
-	// Operations.
-	changeset: Vec<(ColId, Key, Option<Value>)>,
-}
-
-// Pending commits. This may not grow beyond `MAX_COMMIT_QUEUE_BYTES` bytes.
-#[derive(Default)]
-struct CommitQueue {
-	// Log record.
-	record_id: u64,
-	// Total size of all commits in the queue.
-	bytes: usize,
-	// FIFO queue.
-	commits: VecDeque<Commit>,
-}
-
-#[derive(Default)]
-struct IdentityKeyHash(u64);
-type IdentityBuildHasher = std::hash::BuildHasherDefault<IdentityKeyHash>;
-
-impl std::hash::Hasher for IdentityKeyHash {
-	fn write(&mut self, bytes: &[u8]) {
-		self.0 = u64::from_le_bytes((&bytes[0..8]).try_into().unwrap())
-	}
-
-	fn finish(&self) -> u64 {
-		self.0
-	}
-}
-
 struct DbInner {
 	columns: Vec<Column>,
 	options: Options,
 	shutdown: AtomicBool,
 	log: Log,
-	commit_queue: Mutex<CommitQueue>,
-	commit_queue_full_cv: Condvar,
 	log_worker_cv: Condvar,
 	log_work: Mutex<bool>,
 	commit_worker_cv: Condvar,
 	commit_work: Mutex<bool>,
-	// Overlay of most recent values int the commit queue. ColumnId -> (Key -> (RecordId, Value)).
-	commit_overlay: RwLock<Vec<HashMap<Key, (u64, Option<Value>), IdentityBuildHasher>>>,
 	log_cv: Condvar,
 	log_queue_bytes: Mutex<u64>,
 	flush_worker_cv: Condvar,
@@ -113,7 +65,6 @@ struct DbInner {
 	next_reindex: AtomicU64,
 	collect_stats: bool,
 	bg_err: Mutex<Option<Arc<Error>>>,
-	fast_worker: bool,
 	_lock_file: std::fs::File,
 }
 
@@ -127,12 +78,8 @@ impl DbInner {
 
 		let salt = options.load_and_validate_metadata()?;
 		let mut columns = Vec::with_capacity(options.columns.len());
-		let mut commit_overlay = Vec::with_capacity(options.columns.len());
 		for c in 0 .. options.columns.len() {
 			columns.push(Column::open(c as ColId, &options, salt.clone())?);
-			commit_overlay.push(
-				HashMap::with_hasher(std::hash::BuildHasherDefault::<IdentityKeyHash>::default())
-			);
 		}
 		log::debug!(target: "parity-db", "Opened db {:?}, salt={:?}", options, salt);
 		Ok(DbInner {
@@ -140,13 +87,10 @@ impl DbInner {
 			options: options.clone(),
 			shutdown: std::sync::atomic::AtomicBool::new(false),
 			log: Log::open(&options)?,
-			commit_queue: Mutex::new(Default::default()),
-			commit_queue_full_cv: Condvar::new(),
 			log_worker_cv: Condvar::new(),
 			log_work: Mutex::new(false),
 			commit_worker_cv: Condvar::new(),
 			commit_work: Mutex::new(false),
-			commit_overlay: RwLock::new(commit_overlay),
 			log_queue_bytes: Mutex::new(0),
 			log_cv: Condvar::new(),
 			flush_worker_cv: Condvar::new(),
@@ -156,7 +100,6 @@ impl DbInner {
 			last_enacted: AtomicU64::new(1),
 			collect_stats: options.stats,
 			bg_err: Mutex::new(None),
-			fast_worker: false,
 			_lock_file: lock_file,
 		})
 	}
@@ -181,13 +124,6 @@ impl DbInner {
 
 	fn get(&self, col: ColId, key: &[u8]) -> Result<Option<Value>> {
 		let key = self.columns[col as usize].hash(key);
-		if self.fast_worker {
-			let overlay = self.commit_overlay.read();
-			// Check commit overlay first
-			if let Some(v) = overlay.get(col as usize).and_then(|o| o.get(&key).map(|(_, v)| v.clone())) {
-				return Ok(v);
-			}
-		}
 		// Go into tables and log overlay.
 		let log = self.log.overlays();
 		self.columns[col as usize].get(&key, log)
@@ -195,15 +131,6 @@ impl DbInner {
 
 	fn get_size(&self, col: ColId, key: &[u8]) -> Result<Option<u32>> {
 		let key = self.columns[col as usize].hash(key);
-		if self.fast_worker {
-			let overlay = self.commit_overlay.read();
-			// Check commit overlay first
-			if let Some(l) = overlay.get(col as usize).and_then(
-				|o| o.get(&key).map(|(_, v)| v.as_ref().map(|v| v.len() as u32))
-			) {
-				return Ok(l);
-			}
-		}
 		// Go into tables and log overlay.
 		let log = self.log.overlays();
 		self.columns[col as usize].get_size(&key, log)
@@ -226,191 +153,54 @@ impl DbInner {
 		let changeset = tx.into_iter().map(
 			|(c, k, v)| (c, self.columns[c as usize].hash(k.as_ref()), v)
 		);
-		if self.fast_worker {
-			let commit: Vec<_> = changeset.collect();
-			let mut queue = self.commit_queue.lock();
-			if queue.bytes > MAX_COMMIT_QUEUE_BYTES {
-				self.commit_queue_full_cv.wait(&mut queue);
+		let mut writer = self.log.begin_record();
+		log::debug!(
+			target: "parity-db",
+			"Processing commit record {}",
+			writer.record_id(),
+		);
+		let mut ops: u64 = 0;
+		let mut reindex = false;
+		for (c, key, value) in changeset {
+			// TODO write_plan passing by value.
+			match self.columns[c as usize].write_plan(&key, &value, &mut writer)? {
+				// Reindex has triggered another reindex.
+				PlanOutcome::NeedReindex => {
+					reindex = true;
+				},
+				_ => {},
 			}
-			let mut overlay = self.commit_overlay.write();
-
-			queue.record_id += 1;
-			let record_id = queue.record_id + 1;
-
-			let mut bytes = 0;
-			for (c, k, v) in &commit {
-				bytes += k.len();
-				bytes += v.as_ref().map_or(0, |v|v.len());
-				// Don't add removed ref-counted values to overlay.
-				if !self.options.columns[*c as usize].ref_counted || v.is_some() {
-					overlay[*c as usize].insert(*k, (record_id, v.clone()));
-				}
-			}
-
-			let commit = Commit {
-				id: record_id,
-				changeset: commit,
-				bytes,
-			};
-
-			log::debug!(
-				target: "parity-db",
-				"Queued commit {}, {} bytes",
-				commit.id,
-				bytes,
-			);
-			queue.commits.push_back(commit);
-			queue.bytes += bytes;
-			self.signal_log_worker();
-		} else {
-			let mut writer = self.log.begin_record();
-			log::debug!(
-				target: "parity-db",
-				"Processing commit record {}",
-				writer.record_id(),
-			);
-			let mut ops: u64 = 0;
-			let mut reindex = false;
-			for (c, key, value) in changeset {
-				// TODO write_plan passing by value.
-				match self.columns[c as usize].write_plan(&key, &value, &mut writer)? {
-					// Reindex has triggered another reindex.
-					PlanOutcome::NeedReindex => {
-						reindex = true;
-					},
-					_ => {},
-				}
-				ops += 1;
-			}
-			// Collect final changes to value tables
-			for c in self.columns.iter() {
-				c.complete_plan(&mut writer)?;
-			}
-			let record_id = writer.record_id();
-			let l = writer.drain();
-
-			let bytes = {
-				let mut logged_bytes = self.log_queue_bytes.lock();
-				let bytes = self.log.end_record(l)?;
-				*logged_bytes += bytes;
-
-				self.signal_flush_worker();
-				bytes
-			};
-			self.log.sync_appending()?;
-
-			if reindex {
-				self.start_reindex(record_id);
-				self.signal_log_worker();
-			}
-			log::debug!(
-				target: "parity-db",
-				"Processed commit (record {}), {} ops, {} bytes written",
-				record_id,
-				ops,
-				bytes,
-			);
+			ops += 1;
 		}
-		Ok(())
-	}
-
-	fn process_commits(&self) -> Result<bool> {
-		{
-			// Wait if the queue is too big.
-			let mut queue = self.log_queue_bytes.lock();
-			if *queue > MAX_LOG_QUEUE_BYTES {
-				self.log_cv.wait(&mut queue);
-			}
+		// Collect final changes to value tables
+		for c in self.columns.iter() {
+			c.complete_plan(&mut writer)?;
 		}
-		let commit = {
-			let mut queue = self.commit_queue.lock();
-			if let Some(commit) = queue.commits.pop_front() {
-				queue.bytes -= commit.bytes;
-				log::debug!(
-					target: "parity-db",
-					"Removed {}. Still queued commits {} bytes",
-					commit.bytes,
-					queue.bytes,
-				);
-				if queue.bytes <= MAX_COMMIT_QUEUE_BYTES && (queue.bytes + commit.bytes) > MAX_COMMIT_QUEUE_BYTES {
-					// Past the waiting threshold.
-					log::debug!(
-						target: "parity-db",
-						"Waking up commit queue worker",
-					);
-					self.commit_queue_full_cv.notify_one();
-				}
-				Some(commit)
-			} else {
-				None
-			}
+		let record_id = writer.record_id();
+		let l = writer.drain();
+
+		let bytes = {
+			let mut logged_bytes = self.log_queue_bytes.lock();
+			let bytes = self.log.end_record(l)?;
+			*logged_bytes += bytes;
+
+			self.signal_flush_worker();
+			bytes
 		};
+		self.log.sync_appending()?;
 
-		if let Some(commit) = commit {
-			let mut reindex = false;
-			let mut writer = self.log.begin_record();
-			log::debug!(
-				target: "parity-db",
-				"Processing commit {}, record {}, {} bytes",
-				commit.id,
-				writer.record_id(),
-				commit.bytes,
-			);
-			let mut ops: u64 = 0;
-			for (c, key, value) in commit.changeset.iter() {
-				match self.columns[*c as usize].write_plan(key, value, &mut writer)? {
-					// Reindex has triggered another reindex.
-					PlanOutcome::NeedReindex => {
-						reindex = true;
-					},
-					_ => {},
-				}
-				ops += 1;
-			}
-			// Collect final changes to value tables
-			for c in self.columns.iter() {
-				c.complete_plan(&mut writer)?;
-			}
-			let record_id = writer.record_id();
-			let l = writer.drain();
-
-			let bytes = {
-				let mut logged_bytes = self.log_queue_bytes.lock();
-				let bytes = self.log.end_record(l)?;
-				*logged_bytes += bytes;
-				self.signal_flush_worker();
-				bytes
-			};
-
-			{
-				// Cleanup the commit overlay.
-				let mut overlay = self.commit_overlay.write();
-				for (c, key, _) in commit.changeset.iter() {
-					let overlay = &mut overlay[*c as usize];
-					if let std::collections::hash_map::Entry::Occupied(e) = overlay.entry(*key) {
-						if e.get().0 == commit.id {
-							e.remove_entry();
-						}
-					}
-				}
-			}
-
-			if reindex {
-				self.start_reindex(record_id);
-			}
-
-			log::debug!(
-				target: "parity-db",
-				"Processed commit {} (record {}), {} ops, {} bytes written",
-				commit.id,
-				record_id,
-				ops,
-				bytes,
-			);
-			Ok(true)
-		} else {
-			Ok(false)
+		if reindex {
+			self.start_reindex(record_id);
+			self.signal_log_worker();
 		}
+		log::debug!(
+			target: "parity-db",
+			"Processed commit (record {}), {} ops, {} bytes written",
+			record_id,
+			ops,
+			bytes,
+		);
+		Ok(())
 	}
 
 	fn start_reindex(&self, record_id: u64) {
@@ -679,9 +469,8 @@ impl Db {
 			flush_worker_db.store_err(Self::flush_worker(flush_worker_db.clone()))
 		);
 		let log_worker_db = db.clone();
-		let fast_worker = db.fast_worker;
 		let log_thread = std::thread::spawn(move ||
-			log_worker_db.store_err(Self::log_worker(log_worker_db.clone(), fast_worker))
+			log_worker_db.store_err(Self::log_worker(log_worker_db.clone()))
 		);
 		Ok(Db {
 			inner: db,
@@ -728,7 +517,7 @@ impl Db {
 		Ok(())
 	}
 
-	fn log_worker(db: Arc<DbInner>, fast_worker: bool) -> Result<()> {
+	fn log_worker(db: Arc<DbInner>) -> Result<()> {
 		// Start with pending reindex.
 		let mut more_work = db.process_reindex()?;
 		while !db.shutdown.load(Ordering::SeqCst) {
@@ -740,13 +529,7 @@ impl Db {
 				*work = false;
 			}
 
-			let more_commits = if fast_worker {
-				db.process_commits()?
-			} else {
-				false
-			};
-			let more_reindex = db.process_reindex()?;
-			more_work = more_commits || more_reindex;
+			more_work = db.process_reindex()?;
 		}
 		log::debug!(target: "parity-db", "Log worker shutdown");
 		Ok(())

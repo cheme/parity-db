@@ -478,10 +478,10 @@ impl Log {
 	}
 
 	pub fn sync_appending(&self) -> Result<()> {
-		if self.sync {
+		/*if self.sync {
 			let mut appending = self.appending.write();
 			appending.file.get_mut().sync_data()?;
-		}
+		}*/
 		Ok(())
 	}
 
