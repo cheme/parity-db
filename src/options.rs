@@ -54,23 +54,34 @@ pub struct ColumnOptions {
 	pub compression: crate::compress::CompressionType,
 	/// Minimal value size treshold to attempt compressing a value.
 	pub compression_treshold: u32,
+	/// Full key is stored in table instead of hash.
+	pub attach_key: bool,
+	/// Collection do not use index, only table api.
+	pub no_indexing: bool,
 }
 
 impl ColumnOptions {
 	fn as_string(&self) -> String {
-		format!("preimage: {}, uniform: {}, refc: {}, compression: {}, sizes: [{}]",
+		format!("preimage: {}, uniform: {}, refc: {}, compression: {}, with_key: {}, no_index: {}, insizes: [{}]",
 			self.preimage,
 			self.uniform,
 			self.ref_counted,
 			self.compression as u8,
+			self.attach_key,
+			self.no_indexing,
 			self.sizes.iter().fold(String::new(), |mut r, s| {
 				if !r.is_empty() {
 					r.push_str(", ");
 				}
 				r.push_str(&s.to_string());
 				r
-			})
+			}),
 		)
+	}
+
+	pub fn is_valid(&self) -> bool {
+		// TODO actually no incompatibility ?? just useless combination.
+		true
 	}
 }
 
@@ -82,6 +93,8 @@ impl Default for ColumnOptions {
 			ref_counted: false,
 			compression: crate::compress::CompressionType::NoCompression,
 			compression_treshold: 4096,
+			attach_key: false,
+			no_indexing: false,
 			sizes: [96, 128, 192, 256, 320, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192, 16384, 32768],
 		}
 	}
@@ -150,5 +163,14 @@ impl Options {
 			}
 		}
 		Ok(salt)
+	}
+
+	pub fn is_valid(&self) -> bool {
+		for option in self.columns.iter() {
+			if !option.is_valid() {
+				return false;
+			}
+		}
+		true
 	}
 }
