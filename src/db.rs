@@ -36,7 +36,7 @@ use std::collections::{HashMap, VecDeque};
 use parking_lot::{RwLock, Mutex, Condvar};
 use fs2::FileExt;
 use crate::{
-	table::Key,
+	Key,
 	error::{Error, Result},
 	column::{ColId, Column},
 	log::{Log, LogAction},
@@ -237,7 +237,7 @@ impl DbInner {
 				bytes += v.as_ref().map_or(0, |v|v.len());
 				// Don't add removed ref-counted values to overlay.
 				if !self.options.columns[*c as usize].ref_counted || v.is_some() {
-					overlay[*c as usize].insert(*k, (record_id, v.clone()));
+					overlay[*c as usize].insert(k.clone(), (record_id, v.clone()));
 				}
 			}
 
@@ -333,7 +333,7 @@ impl DbInner {
 				let mut overlay = self.commit_overlay.write();
 				for (c, key, _) in commit.changeset.iter() {
 					let overlay = &mut overlay[*c as usize];
-					if let std::collections::hash_map::Entry::Occupied(e) = overlay.entry(*key) {
+					if let std::collections::hash_map::Entry::Occupied(e) = overlay.entry(key.clone()) {
 						if e.get().0 == commit.id {
 							e.remove_entry();
 						}

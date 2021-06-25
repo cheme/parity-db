@@ -17,6 +17,7 @@
 use std::convert::TryInto;
 use parking_lot::{RwLockUpgradableReadGuard, RwLock};
 use crate::{
+	Key,
 	error::{Error, Result},
 	column::ColId,
 	log::{LogReader, LogWriter, LogQuery},
@@ -29,12 +30,10 @@ const CHUNK_ENTRIES: usize = 1 << CHUNK_ENTRIES_BITS;
 const CHUNK_ENTRIES_BITS: u8 = 6;
 const HEADER_SIZE: usize = 512;
 const META_SIZE: usize = crate::table::SIZE_TIERS * 1024; // Contains header and column stats
-const KEY_LEN: usize = 32;
 const ENTRY_LEN: u8 = 64;
 
 const EMPTY_CHUNK: Chunk = [0u8; CHUNK_LEN];
 
-pub type Key = [u8; KEY_LEN];
 pub type Chunk = [u8; CHUNK_LEN];
 
 #[derive(PartialEq, Eq)]
@@ -256,7 +255,7 @@ impl IndexTable {
 
 	pub fn get(&self, key: &Key, sub_index: usize, log: &impl LogQuery) -> (Entry, usize) {
 		log::trace!(target: "parity-db", "{}: Querying {}", self.id, hex(&key));
-		let key = u64::from_be_bytes((key[0..8]).try_into().unwrap());
+		let key = key.index();
 		let chunk_index = self.chunk_index(key);
 
 		if let Some(entry) = log.with_index(self.id, chunk_index, |chunk| {
@@ -356,7 +355,7 @@ impl IndexTable {
 
 	pub fn write_insert_plan(&self, key: &Key, address: Address, sub_index: Option<usize>, log: &mut LogWriter) -> Result<PlanOutcome> {
 		log::trace!(target: "parity-db", "{}: Inserting {} -> {}", self.id, hex(&key), address);
-		let key = u64::from_be_bytes((key[0..8]).try_into().unwrap());
+		let key = key.index();
 		let chunk_index = self.chunk_index(key);
 
 		if let Some(chunk) = log.with_index(self.id, chunk_index, |chunk| chunk.clone()) {
@@ -392,7 +391,7 @@ impl IndexTable {
 
 	pub fn write_remove_plan(&self, key: &Key, sub_index: usize, log: &mut LogWriter) -> Result<PlanOutcome> {
 		log::trace!(target: "parity-db", "{}: Removing {}", self.id, hex(&key));
-		let key = u64::from_be_bytes((key[0..8]).try_into().unwrap());
+		let key = key.index();
 		let chunk_index = self.chunk_index(key);
 
 		if let Some(chunk) = log.with_index(self.id, chunk_index, |chunk| chunk.clone()) {

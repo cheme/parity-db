@@ -60,13 +60,13 @@ use std::mem::MaybeUninit;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use crate::{
+	Key, KEY_LEN,
 	error::Result,
 	column::ColId,
 	log::{LogQuery, LogReader, LogWriter},
 	display::hex,
 };
 
-pub const KEY_LEN: usize = 32;
 pub const SIZE_TIERS: usize = 16;
 pub const SIZE_TIERS_BITS: u8 = 4;
 const MAX_ENTRY_SIZE: usize = 0xfffd;
@@ -77,8 +77,6 @@ const COMPRESSED_MASK: u32 = 0xa0_00_00_00;
 // When a rc reach locked ref, it is locked in db.
 const LOCKED_REF: u32 = 0x7fff_ffff;
 
-
-pub type Key = [u8; KEY_LEN];
 pub type Value = Vec<u8>;
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
@@ -264,13 +262,13 @@ impl ValueTable {
 			if part == 0 {
 				let rc = u32::from_le_bytes(buf[content_offset..content_offset + 4].try_into().unwrap());
 				compressed = rc & COMPRESSED_MASK > 0;
-				if key[6..] != buf[content_offset + 4..content_offset + 30] {
+				if key.table_slice() != &buf[content_offset + 4..content_offset + 30] {
 					log::debug!(
 						target: "parity-db",
 						"{}: Key mismatch at {}. Expected {}, got {}",
 						self.id,
 						index,
-						hex(&key[6..]),
+						hex(key.table_slice()),
 						hex(&buf[content_offset + 4..content_offset + 30]),
 					);
 					return Ok((false, false));
@@ -308,14 +306,15 @@ impl ValueTable {
 
 	pub fn has_key_at(&self, index: u64, key: &Key, log: &LogWriter) -> Result<bool> {
 		Ok(match self.partial_key_at(index, log)? {
-			Some(existing_key) => &existing_key[6..] == &key [6..],
+			Some(existing_key) => &existing_key[6..] == key.table_slice(),
 			None => false,
 		})
 	}
 
-	pub fn partial_key_at<Q: LogQuery>(&self, index: u64, log: &Q) -> Result<Option<Key>> {
+	// TODO consider removing unused 6 first bytes.
+	pub fn partial_key_at<Q: LogQuery>(&self, index: u64, log: &Q) -> Result<Option<[u8; KEY_LEN]>> {
 		let mut buf = [0u8; 40];
-		let mut result = Key::default();
+		let mut result = [0u8; KEY_LEN];
 		let buf = if log.value(self.id, index, &mut buf) {
 			&buf
 		} else {
@@ -442,7 +441,7 @@ impl ValueTable {
 					1u32
 				};
 				buf[target_offset..target_offset + 4].copy_from_slice(&rc.to_le_bytes());
-				buf[target_offset + 4..target_offset + 30].copy_from_slice(&key[6..]);
+				buf[target_offset + 4..target_offset + 30].copy_from_slice(key.table_slice());
 				buf[target_offset + 30..target_offset + value_len]
 					.copy_from_slice(&value[offset..offset + value_len - 30]);
 				offset += value_len - 30;
@@ -742,9 +741,10 @@ mod test {
 	}
 
 	fn key(k: u32) -> Key {
-		let mut key = Key::default();
+		let mut key = [0u8; crate::KEY_LEN];
 		key.copy_from_slice(blake2_rfc::blake2b::blake2b(32, &[], &k.to_le_bytes()).as_bytes());
-		key
+		// TODO variant with included key
+		Key::Hash(key)
 	}
 
 	fn value(size: usize) -> Value {

@@ -18,8 +18,9 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::RwLock;
 use crate::{
+	Key,
 	error::{Error, Result},
-	table::{TableId as ValueTableId, ValueTable, Key, Value},
+	table::{TableId as ValueTableId, ValueTable, Value},
 	log::{Log, LogOverlays, LogReader, LogWriter, LogAction},
 	display::hex,
 	index::{IndexTable, TableId as IndexTableId, PlanOutcome, Address},
@@ -52,6 +53,8 @@ pub struct Column {
 	uniform_keys: bool,
 	collect_stats: bool,
 	ref_counted: bool,
+	attach_key: bool,
+	no_indexing: bool,
 	salt: Option<Salt>,
 	stats: ColumnStats,
 	compression: Compress,
@@ -176,6 +179,8 @@ impl Column {
 			preimage: options.preimage,
 			uniform_keys: options.uniform,
 			ref_counted: options.ref_counted,
+			attach_key: options.attach_key,
+			no_indexing: options.no_indexing,
 			collect_stats,
 			salt,
 			stats,
@@ -184,15 +189,29 @@ impl Column {
 	}
 
 	pub fn hash(&self, key: &[u8]) -> Key {
-		let mut k = Key::default();
-		if self.uniform_keys {
-			k.copy_from_slice(&key[0..32]);
-		} else if let Some(salt) = &self.salt {
-			k.copy_from_slice(blake2_rfc::blake2b::blake2b(32, &salt[..], &key).as_bytes());
+		assert!(!self.no_indexing);
+		if self.attach_key {
+			let mut k = [0u8; 8];
+			if self.uniform_keys {
+				k.copy_from_slice(&key[0..32]);
+			} else if let Some(salt) = &self.salt {
+				k.copy_from_slice(blake2_rfc::blake2b::blake2b(8, &salt[..], &key).as_bytes());
+			} else {
+				k.copy_from_slice(blake2_rfc::blake2b::blake2b(8, &[], &key).as_bytes());
+			}
+			use std::convert::TryInto;
+			Key::WithKey(u64::from_be_bytes((k).try_into().unwrap()), key.to_vec())
 		} else {
-			k.copy_from_slice(blake2_rfc::blake2b::blake2b(32, &[], &key).as_bytes());
+			let mut k = [0u8; crate::KEY_LEN];
+			if self.uniform_keys {
+				k.copy_from_slice(&key[0..32]);
+			} else if let Some(salt) = &self.salt {
+				k.copy_from_slice(blake2_rfc::blake2b::blake2b(32, &salt[..], &key).as_bytes());
+			} else {
+				k.copy_from_slice(blake2_rfc::blake2b::blake2b(32, &[], &key).as_bytes());
+			}
+			Key::Hash(k)
 		}
-		k
 	}
 
 	pub fn flush(&self) -> Result<()> {
@@ -534,7 +553,7 @@ impl Column {
 						let k = 64 - crate::index::Entry::address_bits(source.id.index_bits());
 						let index_key = (source_index << 64 - source.id.index_bits()) |
 							(partial_key << (64 - k - source.id.index_bits()));
-						let mut key = Key::default();
+						let mut key = [0u8; crate::KEY_LEN];
 						// restore 16 high bits
 						&mut key[0..8].copy_from_slice(&index_key.to_be_bytes());
 						let address = entry.address(source.id.index_bits());
@@ -542,7 +561,8 @@ impl Column {
 							.partial_key_at(address.offset(), &*log.overlays())? {
 							&mut key[6..].copy_from_slice(&partial_key[6..]);
 							log::trace!(target: "parity-db", "{}: Reinserting {}", source.id, hex(&key));
-							plan.push((key, entry.address(source.id.index_bits())))
+							// TODO with key variant
+							plan.push((Key::Hash(key), entry.address(source.id.index_bits())))
 						} else {
 							log::error!(target: "parity-db", "Missing value for reindexing {}, {}", source.id, hex(&key));
 						}
