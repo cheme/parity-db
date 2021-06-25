@@ -62,12 +62,15 @@ impl AsRef<[u8]> for Key {
 
 
 impl Key {
-	pub fn len(&self) -> usize {
+	pub fn encoded_len(&self) -> usize {
 		match self {
 			Key::Hash(hash) => hash.len(),
-			Key::WithKey(_hash, full) => full.len(),
+			Key::WithKey(_hash, full) => {
+				varint_encoded_len(full.len() as u64) + full.len()
+			},
 		}
 	}
+
 
 	pub fn table_slice(&self) -> &[u8] {
 		match self {
@@ -148,8 +151,6 @@ fn test_varint() {
 		let decoded = varint_decode(&buff[..]);
 		assert_eq!(decoded, (end, encoded.len()));
 		assert_eq!(encoded.len(), i + 1);
-
-		// prev = encoded;
 	}
 	let i = 1 << 63;
 	let encoded = varint_encode(i, &mut buff).to_vec();

@@ -183,6 +183,10 @@ impl ValueTable {
 	}
 
 	pub fn value_size(&self) -> u16 {
+		// SIZE + REFS + KEY = KEY_LEN
+		// TODO with value: makes it - 2 + 4 as no keys 
+		// TODO without RC: - 4 + 1 (need store if compressed): warn need to have size that make
+		// correct sectors.
 		self.entry_size - KEY_LEN as u16
 	}
 
@@ -391,6 +395,7 @@ impl ValueTable {
 		let mut remainder = value.len() + 30; // Prefix with key and ref counter
 		let mut offset = 0;
 		let mut start = 0;
+		// TODO here assert that when with_key value.len() + key.len() <= self.value size
 		assert!(self.multipart || value.len() <= self.value_size() as usize);
 		let (mut index, mut follow) = match at {
 			Some(index) => (index, true),

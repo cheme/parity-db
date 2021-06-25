@@ -112,11 +112,11 @@ impl Column {
 
 	/// Compress if needed and return the target tier to use.
 	fn compress(&self, key: &Key, value: &[u8], tables: &Tables) -> (Option<Vec<u8>>, usize) {
-		Self::compress_internal(&self.compression, key, value, tables)
+		Self::compress_internal(&self.compression, key, value, tables, self.attach_key)
 	}
 
-	fn compress_internal(compression: &Compress, key: &Key, value: &[u8], tables: &Tables) -> (Option<Vec<u8>>, usize) {
-		let (len, result) = if value.len() > compression.treshold as usize {
+	fn compress_internal(compression: &Compress, key: &Key, value: &[u8], tables: &Tables, attach_key: bool) -> (Option<Vec<u8>>, usize) {
+		let (mut len, result) = if value.len() > compression.treshold as usize {
 			let cvalue = compression.compress(value);
 			if cvalue.len() <= value.len() {
 				(cvalue.len(), Some(cvalue))
@@ -126,6 +126,9 @@ impl Column {
 		} else {
 			(value.len(), None)
 		};
+		if attach_key {
+			len += key.encoded_len();
+		}
 		let target_tier = tables.value.iter().position(|t| len <= t.value_size() as usize);
 		let target_tier = match target_tier {
 			Some(tier) => tier as usize,

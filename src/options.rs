@@ -81,6 +81,16 @@ impl ColumnOptions {
 
 	pub fn is_valid(&self) -> bool {
 		// TODO actually no incompatibility ?? just useless combination.
+
+		// This maybe, we got some ref counted assertion like
+		// remove do not update overlay which only works for
+		// case where we do not mind about removal consistency.
+		// (see commit for db function).
+		// TODO maybe a new option for removal consistency.
+		/*if self.ref_counted && !self.uniform {
+			return false;
+		}*/
+
 		true
 	}
 }

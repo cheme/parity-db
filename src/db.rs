@@ -233,7 +233,7 @@ impl DbInner {
 
 			let mut bytes = 0;
 			for (c, k, v) in &commit {
-				bytes += k.len();
+				bytes += k.encoded_len();
 				bytes += v.as_ref().map_or(0, |v|v.len());
 				// Don't add removed ref-counted values to overlay.
 				if !self.options.columns[*c as usize].ref_counted || v.is_some() {
