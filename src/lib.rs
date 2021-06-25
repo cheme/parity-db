@@ -93,8 +93,7 @@ impl Key {
 
 
 fn varint_encode(mut size: u64, buf: &mut [u8; 10]) -> &[u8] {
-	let nb_bit = std::cmp::max(64 - size.leading_zeros(), 1);
-	let nb = (nb_bit as usize + 6) / 7;
+	let nb = varint_encoded_len(size);
 	for i in (0..nb).rev() {
 		buf[i] = (size as u8) | 0b1000_0000;
 		size >>= 7;
@@ -121,6 +120,11 @@ fn varint_decode(buf: &[u8]) -> (u64, usize) {
 	panic!("Out of range varint");
 }
 
+fn varint_encoded_len(size: u64) -> usize {
+	let nb_bit = std::cmp::max(64 - size.leading_zeros(), 1);
+	(nb_bit as usize + 6) / 7
+}
+
 #[test]
 fn test_varint() {
 	// let mut prev = vec![];
@@ -132,6 +136,26 @@ fn test_varint() {
 		assert_eq!(decoded, (i, encoded.len()));
 		// prev = encoded;
 	}
+	for i in 0..9 {
+		let start = 1 << (i * 7);
+		let end = 1 << ((i + 1) * 7);
+		let end = end - 1;
+		let encoded = varint_encode(start, &mut buff).to_vec();
+		let decoded = varint_decode(&buff[..]);
+		assert_eq!(decoded, (start, encoded.len()));
+		assert_eq!(encoded.len(), i + 1);
+		let encoded = varint_encode(end, &mut buff).to_vec();
+		let decoded = varint_decode(&buff[..]);
+		assert_eq!(decoded, (end, encoded.len()));
+		assert_eq!(encoded.len(), i + 1);
+
+		// prev = encoded;
+	}
+	let i = 1 << 63;
+	let encoded = varint_encode(i, &mut buff).to_vec();
+	assert_eq!(buff.len(), 10);
+	let decoded = varint_decode(&buff[..]);
+	assert_eq!(decoded, (i, encoded.len()));
 	let encoded = varint_encode(u64::MAX, &mut buff).to_vec();
 	assert_eq!(buff.len(), 10);
 	let decoded = varint_decode(&buff[..]);
