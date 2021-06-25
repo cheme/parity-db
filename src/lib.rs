@@ -32,6 +32,7 @@ pub use options::{ColumnOptions, Options};
 const KEY_LEN: usize = 32;
 
 #[derive(PartialEq, Eq, Clone)]
+// TODO traitify enum?
 pub enum Key { // TODO remove pub??
 	Hash([u8; KEY_LEN]),
 	// TODO if withkeyref, try bench against &[u8; KEYLEN] (HashRef)
@@ -88,4 +89,51 @@ impl Key {
 	pub fn default_hash() -> Self {
 		Key::Hash(Default::default())
 	}
+}
+
+
+fn varint_encode(mut size: u64, buf: &mut [u8; 10]) -> &[u8] {
+	let nb_bit = std::cmp::max(64 - size.leading_zeros(), 1);
+	let nb = (nb_bit as usize + 6) / 7;
+	for i in (0..nb).rev() {
+		buf[i] = (size as u8) | 0b1000_0000;
+		size >>= 7;
+		buf[i] |= 0b1000_0000;
+	}
+	buf[nb - 1] &= 0b0111_1111;
+	&buf[..nb]
+}
+
+fn varint_decode(buf: &[u8]) -> (u64, usize) {
+	assert!(buf.len() < 11);
+	let mut result = 0u64;
+	// out of bound error on > u64
+	for i in 0..buf.len() {
+		if buf[i] & 0b1000_0000 > 0 {
+			result <<= 7;
+			result |= (buf[i] & 0b0111_1111) as u64;
+		} else {
+			result <<= 7;
+			result |= buf[i] as u64;
+			return (result, i + 1);
+		}
+	}
+	panic!("Out of range varint");
+}
+
+#[test]
+fn test_varint() {
+	// let mut prev = vec![];
+	let mut buff = [0u8; 10];
+	for i in 0u64..128000 {
+		let encoded = varint_encode(i, &mut buff).to_vec();
+		//	assert!(encoded > prev); This assertion only hold for first two bytes.
+		let decoded = varint_decode(&buff[..]);
+		assert_eq!(decoded, (i, encoded.len()));
+		// prev = encoded;
+	}
+	let encoded = varint_encode(u64::MAX, &mut buff).to_vec();
+	assert_eq!(buff.len(), 10);
+	let decoded = varint_decode(&buff[..]);
+	assert_eq!(decoded, (u64::MAX, encoded.len()));
 }
