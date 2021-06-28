@@ -272,10 +272,14 @@ impl ValueTable {
 				(2, size as usize + 2, 0)
 			};
 
-			if part == 0 {
-				let rc = u32::from_le_bytes(buf[content_offset..content_offset + 4].try_into().unwrap());
-				let content_offset = content_offset + 4;
-				compressed = rc & COMPRESSED_MASK > 0;
+			if part == 0 || (self.attach_key && queried_key_offset != queried_key_len) {
+				let content_offset = if queried_key_offset == 0 {
+					let rc = u32::from_le_bytes(buf[content_offset..content_offset + 4].try_into().unwrap());
+					compressed = rc & COMPRESSED_MASK > 0;
+					content_offset + 4
+				} else {
+					content_offset
+				};
 				let (matched, content_offset, offset_value) = if self.attach_key {
 					let (matched_len, content_offset, upper) = if queried_key_offset == 0 {
 						// read len
@@ -290,13 +294,13 @@ impl ValueTable {
 						let remaining = queried_key_len - queried_key_offset as usize;
 						(true, content_offset, content_offset + remaining)
 					};
-					if upper > buf.len() {
+					if upper > entry_size {
 						// key over multiple part.
-						let upper_key = queried_key_offset + (upper - content_offset) as usize;
-						if !matched_len || &key.table_slice()[queried_key_offset..upper_key] != &buf[content_offset..upper] {
-							(false, content_offset, buf.len())
+						let upper_key = queried_key_offset + (entry_size - content_offset) as usize;
+						if !matched_len || &key.table_slice()[queried_key_offset..upper_key] != &buf[content_offset..entry_size] {
+							(false, content_offset, entry_size)
 						} else {
-							queried_key_offset += upper_key;
+							queried_key_offset = upper_key;
 							part += 1;
 							if next == 0 {
 								break;
@@ -304,9 +308,10 @@ impl ValueTable {
 							index = next;
 							continue;
 						}
-					} else if !matched_len || key.table_slice() != &buf[content_offset..upper] {
+					} else if !matched_len || &key.table_slice()[queried_key_offset..] != &buf[content_offset..upper] {
 						(false, content_offset, upper)
 					} else {
+						queried_key_offset = queried_key_len;
 						(true, content_offset, upper)
 					}
 				} else if key.table_slice() != &buf[content_offset..content_offset + 26] {
@@ -501,46 +506,51 @@ impl ValueTable {
 					next_index = self.next_free(log)?
 				}
 				buf[0..2].copy_from_slice(&MULTIPART);
-				if !self.attach_key {
-					buf[2..10].copy_from_slice(&(next_index as u64).to_le_bytes());
-					(10, free_space - 8)
-				} else {
-					(2, free_space)
-				}
+				buf[2..10].copy_from_slice(&(next_index as u64).to_le_bytes());
+				(10, free_space - 8)
 			} else {
 				buf[0..2].copy_from_slice(&(remainder as u16).to_le_bytes());
 				(2, remainder)
 			};
-			let written = if offset == 0 && key_remaining == encoded_key_len {
-				// first rc.
-				let rc = if compressed {
-					1u32 | COMPRESSED_MASK
-				} else {
-					1u32
-				};
-				buf[target_offset..target_offset + 4].copy_from_slice(&rc.to_le_bytes());
+			let written = if offset == 0 && key_remaining > 0 {
 				let init_offset = target_offset;
-				let target_offset = target_offset + 4;
+				let target_offset = if key_remaining == encoded_key_len {
+					// first rc.
+					let rc = if compressed {
+						1u32 | COMPRESSED_MASK
+					} else {
+						1u32
+					};
+					buf[target_offset..target_offset + 4].copy_from_slice(&rc.to_le_bytes());
+					let target_offset = target_offset + 4;
+					if self.attach_key {
+						let mut buf_len = [0u8; 10];
+						let encoded = crate::varint_encode(key.len() as u64, &mut buf_len);
+						buf[target_offset..target_offset + encoded.len()].copy_from_slice(encoded);
+						key_remaining -= encoded.len();
+						target_offset + encoded.len()
+					} else {
+						buf[target_offset..target_offset + 26].copy_from_slice(key.table_slice());
+						key_remaining = 0;
+						target_offset + 26
+					}
+				} else {
+					target_offset
+				};
 				if self.attach_key {
-					let mut buf_len = [0u8; 10];
-					let encoded = crate::varint_encode(key.len() as u64, &mut buf_len);
-					buf[target_offset..target_offset + encoded.len()].copy_from_slice(encoded);
-					let target_offset = target_offset + encoded.len();
-					key_remaining -= encoded.len();
 					let mut upper = target_offset + key_remaining;
-					if buf.len() < upper {
-						upper = buf.len();
-						buf[target_offset..upper].copy_from_slice(&key.table_slice()[..upper - target_offset]);
+					let key_start = key.table_slice().len() - key_remaining;
+					if (self.entry_size as usize) < upper {
+						upper = self.entry_size as usize;
+						buf[target_offset..upper].copy_from_slice(&key.table_slice()[key_start..key_start + upper - target_offset]);
 						key_remaining -= upper - target_offset;
 					} else {
-						buf[target_offset..upper].copy_from_slice(key.table_slice());
+						buf[target_offset..upper].copy_from_slice(&key.table_slice()[key_start..]);
 						key_remaining = 0;
 					};
 					upper - init_offset
 				} else {
-					buf[target_offset..target_offset + 26].copy_from_slice(key.table_slice());
-					key_remaining = 0;
-					30
+					target_offset - init_offset
 				}
 			} else {
 				0
@@ -891,10 +901,12 @@ mod test {
 
 	#[test]
 	fn remove_simple() {
-		let options = ColumnOptions::default();
-		let options = &options;
+		remove_simple_inner(&Default::default());
+		remove_simple_inner(&attached_key());
+	}
+	fn remove_simple_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("remove_simple");
-		let table = dir.table(Some(ENTRY_SIZE), &Default::default());
+		let table = dir.table(Some(ENTRY_SIZE), options);
 		let log = dir.log();
 
 		let key1 = key(1, options);
@@ -924,10 +936,12 @@ mod test {
 
 	#[test]
 	fn replace_simple() {
-		let options = ColumnOptions::default();
-		let options = &options;
+		replace_simple_inner(&Default::default());
+		replace_simple_inner(&attached_key());
+	}
+	fn replace_simple_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("replace_simple");
-		let table = dir.table(Some(ENTRY_SIZE), &Default::default());
+		let table = dir.table(Some(ENTRY_SIZE), options);
 		let log = dir.log();
 
 		let key1 = key(1, options);
@@ -953,10 +967,12 @@ mod test {
 
 	#[test]
 	fn replace_multipart_shorter() {
-		let options = ColumnOptions::default();
-		let options = &options;
+		replace_multipart_shorter_inner(&attached_key());
+		replace_multipart_shorter_inner(&Default::default());
+	}
+	fn replace_multipart_shorter_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("replace_multipart_shorter");
-		let table = dir.table(None, &Default::default());
+		let table = dir.table(None, options);
 		let log = dir.log();
 
 		let key1 = key(1, options);
@@ -989,10 +1005,12 @@ mod test {
 
 	#[test]
 	fn replace_multipart_longer() {
-		let options = ColumnOptions::default();
-		let options = &options;
+		replace_multipart_longer_inner(&attached_key());
+		replace_multipart_longer_inner(&Default::default());
+	}
+	fn replace_multipart_longer_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("replace_multipart_longer");
-		let table = dir.table(None, &Default::default());
+		let table = dir.table(None, options);
 		let log = dir.log();
 
 		let key1 = key(1, options);
@@ -1020,11 +1038,43 @@ mod test {
 	}
 
 	#[test]
-	fn ref_counting() {
-		let options = ColumnOptions::default();
+	fn long_key_multipart() {
+		let options = attached_key();
 		let options = &options;
+		let dir = TempDir::new("replace_multipart_shorter");
+		let table = dir.table(None, options);
+		let log = dir.log();
+
+		let key1 = value(20000);
+		let key1 = crate::column::hash_utils(&key1[..], options.attach_key, false, &None);
+		let key2 = value(16000);
+		let key2 = crate::column::hash_utils(&key2[..], options.attach_key, false, &None);
+		let val1 = value(30);
+		let val2 = value(5000);
+		let compressed = false;
+
+		write_ops(&table, &log, |writer| {
+			table.write_insert_plan(&key1, &val1, writer, compressed).unwrap();
+			table.write_insert_plan(&key2, &val2, writer, compressed).unwrap();
+		});
+
+		assert_eq!(table.get(&key1, 1, log.overlays()).unwrap(), Some((val1, compressed)));
+		assert_eq!(table.get(&key2, 6, log.overlays()).unwrap(), Some((val2.clone(), compressed)));
+
+		write_ops(&table, &log, |writer| {
+			table.write_replace_plan(1, &key1, &val2, writer, compressed).unwrap();
+		});
+		assert_eq!(table.get(&key1, 1, log.overlays()).unwrap(), Some((val2, compressed)));
+	}
+
+	#[test]
+	fn ref_counting() {
+		ref_counting_inner(&attached_key());
+		ref_counting_inner(&Default::default());
+	}
+	fn ref_counting_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("ref_counting");
-		let table = dir.table(None, &Default::default());
+		let table = dir.table(None, options);
 		let log = dir.log();
 
 		let key = key(1, options);
