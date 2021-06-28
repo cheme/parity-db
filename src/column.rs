@@ -193,28 +193,7 @@ impl Column {
 
 	pub fn hash(&self, key: &[u8]) -> Key {
 		assert!(!self.no_indexing);
-		if self.attach_key {
-			let mut k = [0u8; 8];
-			if self.uniform_keys {
-				k.copy_from_slice(&key[0..32]);
-			} else if let Some(salt) = &self.salt {
-				k.copy_from_slice(blake2_rfc::blake2b::blake2b(8, &salt[..], &key).as_bytes());
-			} else {
-				k.copy_from_slice(blake2_rfc::blake2b::blake2b(8, &[], &key).as_bytes());
-			}
-			use std::convert::TryInto;
-			Key::WithKey(u64::from_be_bytes((k).try_into().unwrap()), key.to_vec())
-		} else {
-			let mut k = [0u8; crate::KEY_LEN];
-			if self.uniform_keys {
-				k.copy_from_slice(&key[0..32]);
-			} else if let Some(salt) = &self.salt {
-				k.copy_from_slice(blake2_rfc::blake2b::blake2b(32, &salt[..], &key).as_bytes());
-			} else {
-				k.copy_from_slice(blake2_rfc::blake2b::blake2b(32, &[], &key).as_bytes());
-			}
-			Key::Hash(k)
-		}
+		hash_utils(key, self.attach_key, self.uniform_keys, &self.salt)
 	}
 
 	pub fn flush(&self) -> Result<()> {
@@ -603,5 +582,30 @@ impl Column {
 		}
 		log::debug!(target: "parity-db", "Dropped {}", id);
 		Ok(())
+	}
+}
+
+pub(crate) fn hash_utils(key: &[u8], attach_key: bool, uniform_keys: bool, salt: &Option<Salt>) -> Key {
+	if attach_key {
+		let mut k = [0u8; 8];
+		if uniform_keys {
+			k.copy_from_slice(&key[0..32]);
+		} else if let Some(salt) = &salt {
+			k.copy_from_slice(blake2_rfc::blake2b::blake2b(8, &salt[..], &key).as_bytes());
+		} else {
+			k.copy_from_slice(blake2_rfc::blake2b::blake2b(8, &[], &key).as_bytes());
+		}
+		use std::convert::TryInto;
+		Key::WithKey(u64::from_be_bytes((k).try_into().unwrap()), key.to_vec())
+	} else {
+		let mut k = [0u8; crate::KEY_LEN];
+		if uniform_keys {
+			k.copy_from_slice(&key[0..32]);
+		} else if let Some(salt) = &salt {
+			k.copy_from_slice(blake2_rfc::blake2b::blake2b(32, &salt[..], &key).as_bytes());
+		} else {
+			k.copy_from_slice(blake2_rfc::blake2b::blake2b(32, &[], &key).as_bytes());
+		}
+		Key::Hash(k)
 	}
 }

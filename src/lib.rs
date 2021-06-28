@@ -114,7 +114,6 @@ fn varint_encode(mut size: u64, buf: &mut [u8; 10]) -> &[u8] {
 }
 
 fn varint_decode(buf: &[u8]) -> (u64, usize) {
-	assert!(buf.len() < 11);
 	let mut result = 0u64;
 	// out of bound error on > u64
 	for i in 0..buf.len() {

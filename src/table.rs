@@ -526,6 +526,7 @@ impl ValueTable {
 					let encoded = crate::varint_encode(key.len() as u64, &mut buf_len);
 					buf[target_offset..target_offset + encoded.len()].copy_from_slice(encoded);
 					let target_offset = target_offset + encoded.len();
+					key_remaining -= encoded.len();
 					let mut upper = target_offset + key_remaining;
 					if buf.len() < upper {
 						upper = buf.len();
@@ -777,7 +778,7 @@ impl ValueTable {
 mod test {
 	const ENTRY_SIZE: u16 = 64;
 	use super::{ValueTable, TableId, Key, Value};
-	use crate::{log::{Log, LogWriter, LogAction}, options::Options};
+	use crate::{log::{Log, LogWriter, LogAction}, options::{Options, ColumnOptions}};
 
 	struct TempDir(std::path::PathBuf);
 
@@ -796,9 +797,9 @@ mod test {
 			TempDir(path)
 		}
 
-		fn table(&self, size: Option<u16>) -> ValueTable {
+		fn table(&self, size: Option<u16>, options: &ColumnOptions) -> ValueTable {
 			let id = TableId::new(0, 0);
-			ValueTable::open(&self.0, id, size, &Default::default()).unwrap()
+			ValueTable::open(&self.0, id, size, options).unwrap()
 		}
 
 		fn log(&self) -> Log {
@@ -840,11 +841,8 @@ mod test {
 		}
 	}
 
-	fn key(k: u32) -> Key {
-		let mut key = [0u8; crate::KEY_LEN];
-		key.copy_from_slice(blake2_rfc::blake2b::blake2b(32, &[], &k.to_le_bytes()).as_bytes());
-		// TODO variant with included key
-		Key::Hash(key)
+	fn key(k: u32, options: &ColumnOptions) -> Key {
+		crate::column::hash_utils(&k.to_le_bytes()[..], options.attach_key, false, &None)
 	}
 
 	fn value(size: usize) -> Value {
@@ -855,13 +853,23 @@ mod test {
 		result
 	}
 
+	fn attached_key() -> ColumnOptions {
+		let mut result = ColumnOptions::default();
+		result.attach_key = true;
+		result
+	}
+
 	#[test]
 	fn insert_simple() {
+		insert_simple_inner(&Default::default());
+		insert_simple_inner(&attached_key());
+	}
+	fn insert_simple_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("insert_simple");
-		let table = dir.table(Some(ENTRY_SIZE));
+		let table = dir.table(Some(ENTRY_SIZE), &options);
 		let log = dir.log();
 
-		let key = key(1);
+		let key = key(1, options);
 		let val = value(19);
 		let compressed = true;
 
@@ -878,17 +886,19 @@ mod test {
 	#[should_panic(expected = "assertion failed: entry_size <= MAX_ENTRY_SIZE as u16")]
 	fn oversized_into_fixed_panics() {
 		let dir = TempDir::new("oversized_into_fixed_panics");
-		let _table = dir.table(Some(65534));
+		let _table = dir.table(Some(65534), &Default::default());
 	}
 
 	#[test]
 	fn remove_simple() {
+		let options = ColumnOptions::default();
+		let options = &options;
 		let dir = TempDir::new("remove_simple");
-		let table = dir.table(Some(ENTRY_SIZE));
+		let table = dir.table(Some(ENTRY_SIZE), &Default::default());
 		let log = dir.log();
 
-		let key1 = key(1);
-		let key2 = key(2);
+		let key1 = key(1, options);
+		let key2 = key(2, options);
 		let val1 = value(11);
 		let val2 = value(21);
 		let compressed = false;
@@ -914,13 +924,15 @@ mod test {
 
 	#[test]
 	fn replace_simple() {
+		let options = ColumnOptions::default();
+		let options = &options;
 		let dir = TempDir::new("replace_simple");
-		let table = dir.table(Some(ENTRY_SIZE));
+		let table = dir.table(Some(ENTRY_SIZE), &Default::default());
 		let log = dir.log();
 
-		let key1 = key(1);
-		let key2 = key(2);
-		let key3 = key(2);
+		let key1 = key(1, options);
+		let key2 = key(2, options);
+		let key3 = key(2, options);
 		let val1 = value(11);
 		let val2 = value(21);
 		let val3 = value(31);
@@ -941,12 +953,14 @@ mod test {
 
 	#[test]
 	fn replace_multipart_shorter() {
+		let options = ColumnOptions::default();
+		let options = &options;
 		let dir = TempDir::new("replace_multipart_shorter");
-		let table = dir.table(None);
+		let table = dir.table(None, &Default::default());
 		let log = dir.log();
 
-		let key1 = key(1);
-		let key2 = key(2);
+		let key1 = key(1, options);
+		let key2 = key(2, options);
 		let val1 = value(20000);
 		let val2 = value(30);
 		let val1s = value(5000);
@@ -975,12 +989,14 @@ mod test {
 
 	#[test]
 	fn replace_multipart_longer() {
+		let options = ColumnOptions::default();
+		let options = &options;
 		let dir = TempDir::new("replace_multipart_longer");
-		let table = dir.table(None);
+		let table = dir.table(None, &Default::default());
 		let log = dir.log();
 
-		let key1 = key(1);
-		let key2 = key(2);
+		let key1 = key(1, options);
+		let key2 = key(2, options);
 		let val1 = value(5000);
 		let val2 = value(30);
 		let val1l = value(20000);
@@ -1005,11 +1021,13 @@ mod test {
 
 	#[test]
 	fn ref_counting() {
+		let options = ColumnOptions::default();
+		let options = &options;
 		let dir = TempDir::new("ref_counting");
-		let table = dir.table(None);
+		let table = dir.table(None, &Default::default());
 		let log = dir.log();
 
-		let key = key(1);
+		let key = key(1, options);
 		let val = value(5000);
 
 		let compressed = true;
