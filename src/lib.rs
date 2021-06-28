@@ -62,6 +62,14 @@ impl AsRef<[u8]> for Key {
 
 
 impl Key {
+	pub fn len(&self) -> usize {
+		match self {
+			Key::Hash(hash) => hash.len(),
+			Key::WithKey(_hash, full) => full.len(),
+		}
+	}
+
+
 	pub fn encoded_len(&self) -> usize {
 		match self {
 			Key::Hash(hash) => hash.len(),
@@ -70,7 +78,6 @@ impl Key {
 			},
 		}
 	}
-
 
 	pub fn table_slice(&self) -> &[u8] {
 		match self {

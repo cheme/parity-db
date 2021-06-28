@@ -232,7 +232,7 @@ impl ValueTable {
 	}
 
 	// Return if there was content, and if it was compressed.
-	pub fn for_parts<Q: LogQuery, F: FnMut(&[u8])>(
+	pub fn for_parts<Q: LogQuery, F: FnMut(&[u8]) -> bool>(
 		&self,
 		key: &Key,
 		mut index: u64,
@@ -244,6 +244,8 @@ impl ValueTable {
 		let mut part = 0;
 		let mut compressed = false;
 		let entry_size = self.entry_size as usize;
+		let mut queried_key_offset = 0;
+		let queried_key_len = key.table_slice().len();
 		loop {
 			let buf = if log.value(self.id, index, &mut buf) {
 				&buf
@@ -262,34 +264,74 @@ impl ValueTable {
 				return Ok((false, false));
 			}
 
-			let (content_offset, content_len, next) = if &buf[0..2] == MULTIPART {
+			let (content_offset, end_entry, next) = if &buf[0..2] == MULTIPART {
 				let next = u64::from_le_bytes(buf[2..10].try_into().unwrap());
-				(10, entry_size - 10, next)
+				(10, entry_size, next)
 			} else {
 				let size: u16 = u16::from_le_bytes(buf[0..2].try_into().unwrap());
-				(2, size as usize, 0)
+				(2, size as usize + 2, 0)
 			};
 
 			if part == 0 {
 				let rc = u32::from_le_bytes(buf[content_offset..content_offset + 4].try_into().unwrap());
+				let content_offset = content_offset + 4;
 				compressed = rc & COMPRESSED_MASK > 0;
-				if self.attach_key {
-					// TODO read len then compare key for as many part as needed. Then bool checked and
-					// compare content with content_offset.
-				} else if key.table_slice() != &buf[content_offset + 4..content_offset + 30] {
+				let (matched, content_offset, offset_value) = if self.attach_key {
+					let (matched_len, content_offset, upper) = if queried_key_offset == 0 {
+						// read len
+						let (stored_len, enc_len) = crate::varint_decode(&buf[content_offset..]);
+						let upper = content_offset + enc_len + stored_len as usize;
+						if stored_len != queried_key_len as u64 {
+							(false, content_offset + enc_len, upper)
+						} else {
+							(true, content_offset + enc_len, upper)
+						}
+					} else {
+						let remaining = queried_key_len - queried_key_offset as usize;
+						(true, content_offset, content_offset + remaining)
+					};
+					if upper > buf.len() {
+						// key over multiple part.
+						let upper_key = queried_key_offset + (upper - content_offset) as usize;
+						if !matched_len || &key.table_slice()[queried_key_offset..upper_key] != &buf[content_offset..upper] {
+							(false, content_offset, buf.len())
+						} else {
+							queried_key_offset += upper_key;
+							part += 1;
+							if next == 0 {
+								break;
+							}
+							index = next;
+							continue;
+						}
+					} else if !matched_len || key.table_slice() != &buf[content_offset..upper] {
+						(false, content_offset, upper)
+					} else {
+						(true, content_offset, upper)
+					}
+				} else if key.table_slice() != &buf[content_offset..content_offset + 26] {
+					(false, content_offset, content_offset + 26)
+				} else {
+					(true, content_offset, content_offset + 26)
+				};
+				if !matched {
 					log::debug!(
 						target: "parity-db",
 						"{}: Key mismatch at {}. Expected {}, got {}",
 						self.id,
 						index,
 						hex(key.table_slice()),
-						hex(&buf[content_offset + 4..content_offset + 30]),
+						hex(&buf[content_offset..offset_value]),
 					);
 					return Ok((false, false));
 				}
-				f(&buf[content_offset + 30..content_offset + content_len]);
+				if !f(&buf[offset_value..end_entry]) {
+					break;
+				};
 			} else {
-				f(&buf[content_offset..content_offset + content_len]);
+				if !f(&buf[content_offset..end_entry]) {
+					break;
+				};
 			}
 			if next == 0 {
 				break;
@@ -302,7 +344,10 @@ impl ValueTable {
 
 	pub fn get(&self, key: &Key, index: u64, log: &impl LogQuery) -> Result<Option<(Value, bool)>> {
 		let mut result = Vec::new();
-		let (success, compressed) = self.for_parts(key, index, log, |buf| result.extend_from_slice(buf))?;
+		let (success, compressed) = self.for_parts(key, index, log, |buf| {
+			result.extend_from_slice(buf);
+			true
+		})?;
 		if success {
 			return Ok(Some((result, compressed)));
 		}
@@ -311,7 +356,10 @@ impl ValueTable {
 
 	pub fn size(&self, key: &Key, index: u64, log: &impl LogQuery) -> Result<Option<(u32, bool)>> {
 		let mut result = 0;
-		let (success, compressed) = self.for_parts(key, index, log, |buf| result += buf.len() as u32)? ;
+		let (success, compressed) = self.for_parts(key, index, log, |buf| {
+			result += buf.len() as u32;
+			true
+		})?;
 		if success {
 			return Ok(Some((result, compressed)));
 		}
@@ -319,10 +367,15 @@ impl ValueTable {
 	}
 
 	pub fn has_key_at(&self, index: u64, key: &Key, log: &LogWriter) -> Result<bool> {
-		Ok(match self.partial_key_at(index, log)? {
-			Some(existing_key) => &existing_key[6..] == key.table_slice(),
-			None => false,
-		})
+		if self.attach_key {
+			let (success, _compressed) = self.for_parts(key, index, log, |_| false)?;
+			Ok(success)
+		} else {
+			Ok(match self.partial_key_at(index, log)? {
+				Some(existing_key) => &existing_key[6..] == key.table_slice(),
+				None => false,
+			})
+		}
 	}
 
 	// TODO consider removing unused 6 first bytes.
@@ -402,7 +455,13 @@ impl ValueTable {
 	}
 
 	fn overwrite_chain(&self, key: &Key, value: &[u8], log: &mut LogWriter, at: Option<u64>, compressed: bool) -> Result<u64> {
-		let mut remainder = value.len() + 30; // Prefix with key and ref counter
+		let encoded_key_len = key.encoded_len();
+		let mut key_remaining = encoded_key_len;
+		let mut remainder = value.len() + 4 + if self.attach_key {
+			key_remaining
+		} else {
+			26
+		}; // Prefix with key and ref counter
 		let mut offset = 0;
 		let mut start = 0;
 		// TODO here assert that when with_key value.len() + key.len() <= self.value size
@@ -442,13 +501,17 @@ impl ValueTable {
 					next_index = self.next_free(log)?
 				}
 				buf[0..2].copy_from_slice(&MULTIPART);
-				buf[2..10].copy_from_slice(&(next_index as u64).to_le_bytes());
-				(10, free_space - 8)
+				if !self.attach_key {
+					buf[2..10].copy_from_slice(&(next_index as u64).to_le_bytes());
+					(10, free_space - 8)
+				} else {
+					(2, free_space)
+				}
 			} else {
 				buf[0..2].copy_from_slice(&(remainder as u16).to_le_bytes());
 				(2, remainder)
 			};
-			if offset == 0 {
+			let written = if offset == 0 && key_remaining == encoded_key_len {
 				// first rc.
 				let rc = if compressed {
 					1u32 | COMPRESSED_MASK
@@ -456,13 +519,35 @@ impl ValueTable {
 					1u32
 				};
 				buf[target_offset..target_offset + 4].copy_from_slice(&rc.to_le_bytes());
-				buf[target_offset + 4..target_offset + 30].copy_from_slice(key.table_slice());
-				buf[target_offset + 30..target_offset + value_len]
-					.copy_from_slice(&value[offset..offset + value_len - 30]);
-				offset += value_len - 30;
+				let init_offset = target_offset;
+				let target_offset = target_offset + 4;
+				if self.attach_key {
+					let mut buf_len = [0u8; 10];
+					let encoded = crate::varint_encode(key.len() as u64, &mut buf_len);
+					buf[target_offset..target_offset + encoded.len()].copy_from_slice(encoded);
+					let target_offset = target_offset + encoded.len();
+					let mut upper = target_offset + key_remaining;
+					if buf.len() < upper {
+						upper = buf.len();
+						buf[target_offset..upper].copy_from_slice(&key.table_slice()[..upper - target_offset]);
+						key_remaining -= upper - target_offset;
+					} else {
+						buf[target_offset..upper].copy_from_slice(key.table_slice());
+						key_remaining = 0;
+					};
+					upper - init_offset
+				} else {
+					buf[target_offset..target_offset + 26].copy_from_slice(key.table_slice());
+					key_remaining = 0;
+					30
+				}
 			} else {
-				buf[target_offset..target_offset + value_len].copy_from_slice(&value[offset..offset + value_len]);
-				offset += value_len;
+				0
+			};
+			if key_remaining == 0 {
+				buf[target_offset + written..target_offset + value_len]
+					.copy_from_slice(&value[offset..offset + value_len - written]);
+				offset += value_len - written;
 			}
 			log.insert_value(self.id, index, buf[0..target_offset + value_len].to_vec());
 			remainder -= value_len;
