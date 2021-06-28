@@ -314,6 +314,8 @@ impl ValueTable {
 						queried_key_offset = queried_key_len;
 						(true, content_offset, upper)
 					}
+				} else if self.no_indexing {
+					(true, content_offset, content_offset)
 				} else if key.table_slice() != &buf[content_offset..content_offset + 26] {
 					(false, content_offset, content_offset + 26)
 				} else {
@@ -464,6 +466,8 @@ impl ValueTable {
 		let mut key_remaining = encoded_key_len;
 		let mut remainder = value.len() + 4 + if self.attach_key {
 			key_remaining
+		} else if self.no_indexing {
+			0
 		} else {
 			26
 		}; // Prefix with key and ref counter
@@ -529,6 +533,9 @@ impl ValueTable {
 						buf[target_offset..target_offset + encoded.len()].copy_from_slice(encoded);
 						key_remaining -= encoded.len();
 						target_offset + encoded.len()
+					} else if self.no_indexing {
+						key_remaining = 0;
+						target_offset
 					} else {
 						buf[target_offset..target_offset + 26].copy_from_slice(key.table_slice());
 						key_remaining = 0;
@@ -869,10 +876,17 @@ mod test {
 		result
 	}
 
+	fn no_indexing() -> ColumnOptions {
+		let mut result = ColumnOptions::default();
+		result.no_indexing = true;
+		result
+	}
+
 	#[test]
 	fn insert_simple() {
 		insert_simple_inner(&Default::default());
 		insert_simple_inner(&attached_key());
+		insert_simple_inner(&no_indexing());
 	}
 	fn insert_simple_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("insert_simple");
@@ -903,6 +917,7 @@ mod test {
 	fn remove_simple() {
 		remove_simple_inner(&Default::default());
 		remove_simple_inner(&attached_key());
+		remove_simple_inner(&no_indexing());
 	}
 	fn remove_simple_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("remove_simple");
@@ -938,6 +953,7 @@ mod test {
 	fn replace_simple() {
 		replace_simple_inner(&Default::default());
 		replace_simple_inner(&attached_key());
+		replace_simple_inner(&no_indexing());
 	}
 	fn replace_simple_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("replace_simple");
@@ -967,8 +983,9 @@ mod test {
 
 	#[test]
 	fn replace_multipart_shorter() {
-		replace_multipart_shorter_inner(&attached_key());
 		replace_multipart_shorter_inner(&Default::default());
+		replace_multipart_shorter_inner(&attached_key());
+		replace_multipart_shorter_inner(&no_indexing());
 	}
 	fn replace_multipart_shorter_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("replace_multipart_shorter");
@@ -1005,8 +1022,9 @@ mod test {
 
 	#[test]
 	fn replace_multipart_longer() {
-		replace_multipart_longer_inner(&attached_key());
 		replace_multipart_longer_inner(&Default::default());
+		replace_multipart_longer_inner(&attached_key());
+		replace_multipart_longer_inner(&no_indexing());
 	}
 	fn replace_multipart_longer_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("replace_multipart_longer");
@@ -1069,8 +1087,9 @@ mod test {
 
 	#[test]
 	fn ref_counting() {
-		ref_counting_inner(&attached_key());
 		ref_counting_inner(&Default::default());
+		ref_counting_inner(&attached_key());
+		ref_counting_inner(&no_indexing());
 	}
 	fn ref_counting_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("ref_counting");
