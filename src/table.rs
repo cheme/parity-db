@@ -65,6 +65,7 @@ use crate::{
 	column::ColId,
 	log::{LogQuery, LogReader, LogWriter},
 	display::hex,
+	options::ColumnOptions as Options,
 };
 
 pub const SIZE_TIERS: usize = 16;
@@ -123,6 +124,8 @@ pub struct ValueTable {
 	last_removed: AtomicU64,
 	dirty_header: AtomicBool,
 	multipart: bool,
+	attach_key: bool,
+	no_indexing: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -141,7 +144,7 @@ fn disable_read_ahead(_file: &std::fs::File) -> Result<()> {
 }
 
 impl ValueTable {
-	pub fn open(path: &std::path::Path, id: TableId, entry_size: Option<u16>) -> Result<ValueTable> {
+	pub fn open(path: &std::path::Path, id: TableId, entry_size: Option<u16>, options: &Options) -> Result<ValueTable> {
 		let (multipart, entry_size) = match entry_size {
 			Some(s) => (false, s),
 			None => (true, 4096),
@@ -179,15 +182,19 @@ impl ValueTable {
 			last_removed: AtomicU64::new(last_removed),
 			dirty_header: AtomicBool::new(false),
 			multipart,
+			attach_key: options.attach_key,
+			no_indexing: options.no_indexing,
 		})
 	}
 
 	pub fn value_size(&self) -> u16 {
 		// SIZE + REFS + KEY = KEY_LEN
-		// TODO with value: makes it - 2 + 4 as no keys 
-		// TODO without RC: - 4 + 1 (need store if compressed): warn need to have size that make
-		// correct sectors.
-		self.entry_size - KEY_LEN as u16
+		if self.attach_key || self.no_indexing {
+			// key size in entry size or no key
+			self.entry_size + (KEY_LEN - 26) as u16
+		} else {
+			self.entry_size - KEY_LEN as u16
+		}
 	}
 
 	#[cfg(unix)]
@@ -266,7 +273,10 @@ impl ValueTable {
 			if part == 0 {
 				let rc = u32::from_le_bytes(buf[content_offset..content_offset + 4].try_into().unwrap());
 				compressed = rc & COMPRESSED_MASK > 0;
-				if key.table_slice() != &buf[content_offset + 4..content_offset + 30] {
+				if self.attach_key {
+					// TODO read len then compare key for as many part as needed. Then bool checked and
+					// compare content with content_offset.
+				} else if key.table_slice() != &buf[content_offset + 4..content_offset + 30] {
 					log::debug!(
 						target: "parity-db",
 						"{}: Key mismatch at {}. Expected {}, got {}",
@@ -703,7 +713,7 @@ mod test {
 
 		fn table(&self, size: Option<u16>) -> ValueTable {
 			let id = TableId::new(0, 0);
-			ValueTable::open(&self.0, id, size).unwrap()
+			ValueTable::open(&self.0, id, size, &Default::default()).unwrap()
 		}
 
 		fn log(&self) -> Log {
