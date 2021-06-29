@@ -741,26 +741,28 @@ impl ValueTable {
 	}
 
 	pub fn change_ref(&self, index: u64, delta: i32, log: &mut LogWriter, compressed: Option<bool>) -> Result<bool> {
-		let mut buf: [u8; MAX_ENTRY_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
-		let buf = if log.value(self.id, index, &mut buf) {
+		let mut buf = Entry::new();
+		let buf = if log.value(self.id, index, &mut buf.1) {
 			&mut buf
 		} else {
-			self.read_at(&mut buf[0..self.entry_size as usize], index * self.entry_size as u64)?;
-			&mut buf[0..self.entry_size as usize]
+			self.read_at(&mut buf.1[0..self.entry_size as usize], index * self.entry_size as u64)?;
+			&mut buf
 		};
 
-		if &buf[0..SIZE_SIZE] == TOMBSTONE {
+		if buf.is_tombstone() {
 			return Ok(false);
 		}
 
-		let (counter_offset, size) = if &buf[0..SIZE_SIZE] == MULTIPART {
+		let (counter_offset, size) = if buf.is_multipart() {
 			(10, self.entry_size as usize)
 		} else {
-			let size: u16 = u16::from_le_bytes(buf[0..SIZE_SIZE].try_into().unwrap());
+			let size = buf.size();
 			(SIZE_SIZE, size as usize + SIZE_SIZE)
 		};
 
-		let mut counter: u32 = u32::from_le_bytes(buf[counter_offset..counter_offset + REFS_SIZE].try_into().unwrap());
+		buf.set_offset(counter_offset);
+
+		let mut counter = buf.read_rc();
 		debug_assert!(compressed.map(|compressed| if counter & COMPRESSED_MASK > 0 {
 				compressed == true
 			} else {
@@ -790,9 +792,10 @@ impl ValueTable {
 			LOCKED_REF
 		};
 
-		buf[counter_offset..counter_offset + 4].copy_from_slice(&counter.to_le_bytes());
+		buf.set_offset(counter_offset);
+		buf.write_rc(counter);
 		// TODO: optimize actual buf size
-		log.insert_value(self.id, index, buf[0..size].to_vec());
+		log.insert_value(self.id, index, buf.1[0..size].to_vec());
 		return Ok(true);
 	}
 
@@ -807,22 +810,22 @@ impl ValueTable {
 			return Ok(());
 		}
 
-		let mut buf: [u8; MAX_ENTRY_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
-		log.read(&mut buf[0..SIZE_SIZE])?;
-		if &buf[0..SIZE_SIZE] == TOMBSTONE {
-			log.read(&mut buf[SIZE_SIZE..10])?;
-			self.write_at(&buf[0..10], index * (self.entry_size as u64))?;
+		let mut buf = Entry::new();
+		log.read(&mut buf.1[0..SIZE_SIZE])?;
+		if buf.is_tombstone() {
+			log.read(&mut buf.1[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE])?;
+			self.write_at(&buf.1[0..SIZE_SIZE + INDEX_SIZE], index * (self.entry_size as u64))?;
 			log::trace!(target: "parity-db", "{}: Enacted tombstone in slot {}", self.id, index);
-		} else if &buf[0..SIZE_SIZE] == MULTIPART {
+		} else if buf.is_multipart() {
 				let entry_size = self.entry_size as usize;
-				log.read(&mut buf[SIZE_SIZE..entry_size])?;
-				self.write_at(&buf[0..entry_size], index * (entry_size as u64))?;
+				log.read(&mut buf.1[SIZE_SIZE..entry_size])?;
+				self.write_at(&buf.1[0..entry_size], index * (entry_size as u64))?;
 				log::trace!(target: "parity-db", "{}: Enacted multipart in slot {}", self.id, index);
 		} else {
-			let len: u16 = u16::from_le_bytes(buf[0..SIZE_SIZE].try_into().unwrap());
-			log.read(&mut buf[SIZE_SIZE..SIZE_SIZE + len as usize])?;
-			self.write_at(&buf[0..(SIZE_SIZE + len as usize)], index * (self.entry_size as u64))?;
-			log::trace!(target: "parity-db", "{}: Enacted {}: {}, {} bytes", self.id, index, hex(&buf[6..32]), len);
+			let len = buf.size();
+			log.read(&mut buf.1[SIZE_SIZE..SIZE_SIZE + len as usize])?;
+			self.write_at(&buf.1[0..(SIZE_SIZE + len as usize)], index * (self.entry_size as u64))?;
+			log::trace!(target: "parity-db", "{}: Enacted {}: {}, {} bytes", self.id, index, hex(&buf.1[6..32]), len);
 		}
 		Ok(())
 	}
@@ -834,21 +837,21 @@ impl ValueTable {
 			// TODO: sanity check last_removed and filled
 			return Ok(());
 		}
-		let mut buf: [u8; MAX_ENTRY_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
-		log.read(&mut buf[0..SIZE_SIZE])?;
-		if &buf[0..SIZE_SIZE] == TOMBSTONE {
-			log.read(&mut buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE])?;
+		let mut buf = Entry::new();
+		log.read(&mut buf.1[0..SIZE_SIZE])?;
+		if buf.is_tombstone() {
+			log.read(&mut buf.1[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE])?;
 			log::trace!(target: "parity-db", "{}: Validated tombstone in slot {}", self.id, index);
 		}
-		else if &buf[0..SIZE_SIZE] == MULTIPART {
+		else if buf.is_multipart() {
 			let entry_size = self.entry_size as usize;
-			log.read(&mut buf[SIZE_SIZE..entry_size])?;
+			log.read(&mut buf.1[SIZE_SIZE..entry_size])?;
 			log::trace!(target: "parity-db", "{}: Validated multipart in slot {}", self.id, index);
 		} else {
 			// TODO: check len
-			let len: u16 = u16::from_le_bytes(buf[0..SIZE_SIZE].try_into().unwrap());
-			log.read(&mut buf[SIZE_SIZE..SIZE_SIZE + len as usize])?;
-			log::trace!(target: "parity-db", "{}: Validated {}: {}, {} bytes", self.id, index, hex(&buf[SIZE_SIZE..32]), len);
+			let len = buf.size();
+			log.read(&mut buf.1[SIZE_SIZE..SIZE_SIZE + len as usize])?;
+			log::trace!(target: "parity-db", "{}: Validated {}: {}, {} bytes", self.id, index, hex(&buf.1[SIZE_SIZE..32]), len);
 		}
 		Ok(())
 	}
