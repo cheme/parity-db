@@ -147,6 +147,24 @@ fn disable_read_ahead(_file: &std::fs::File) -> Result<()> {
 	Ok(())
 }
 
+#[derive(Default, Clone, Copy)]
+struct Header([u8; 16]);
+
+impl Header {
+	fn last_removed(&self) -> u64 {
+		u64::from_le_bytes(self.0[0..INDEX_SIZE].try_into().unwrap())
+	}
+	fn set_last_removed(&mut self, last_removed: u64) {
+		self.0[0..INDEX_SIZE].copy_from_slice(&last_removed.to_le_bytes());
+	}
+	fn filled(&self) -> u64 {
+		u64::from_le_bytes(self.0[INDEX_SIZE..INDEX_SIZE * 2].try_into().unwrap())
+	}
+	fn set_filled(&mut self, filled: u64) {
+		self.0[INDEX_SIZE..INDEX_SIZE * 2].copy_from_slice(&filled.to_le_bytes());
+	}
+}
+
 impl ValueTable {
 	pub fn open(path: &std::path::Path, id: TableId, entry_size: Option<u16>, options: &Options) -> Result<ValueTable> {
 		let (multipart, entry_size) = match entry_size {
@@ -169,10 +187,10 @@ impl ValueTable {
 		}
 
 		let capacity = file_len / entry_size as u64;
-		let mut header: [u8; 16] = Default::default();
-		file.read_exact(&mut header)?;
-		let last_removed = u64::from_le_bytes(header[0..INDEX_SIZE].try_into().unwrap());
-		let mut filled = u64::from_le_bytes(header[INDEX_SIZE..INDEX_SIZE * 2].try_into().unwrap());
+		let mut header = Header::default();
+		file.read_exact(&mut header.0)?;
+		let last_removed = header.last_removed();
+		let mut filled = header.filled();
 		if filled == 0 {
 			filled = 1;
 		}
@@ -710,9 +728,9 @@ impl ValueTable {
 			self.grow()?;
 		}
 		if index == 0 {
-			let mut header = [0u8; 16];
-			log.read(&mut header)?;
-			self.write_at(&header, 0)?;
+			let mut header = Header::default();
+			log.read(&mut header.0)?;
+			self.write_at(&header.0, 0)?;
 			return Ok(());
 		}
 
@@ -738,8 +756,8 @@ impl ValueTable {
 
 	pub fn validate_plan(&self, index: u64, log: &mut LogReader) -> Result<()> {
 		if index == 0 {
-			let mut header = [0u8; 16];
-			log.read(&mut header)?;
+			let mut header = Header::default();
+			log.read(&mut header.0)?;
 			// TODO: sanity check last_removed and filled
 			return Ok(());
 		}
@@ -763,10 +781,10 @@ impl ValueTable {
 	}
 
 	pub fn refresh_metadata(&self) -> Result<()> {
-		let mut header: [u8; 16] = Default::default();
-		self.read_at(&mut header, 0)?;
-		let last_removed = u64::from_le_bytes(header[0..INDEX_SIZE].try_into().unwrap());
-		let mut filled = u64::from_le_bytes(header[INDEX_SIZE..INDEX_SIZE * 2].try_into().unwrap());
+		let mut header = Header::default();
+		self.read_at(&mut header.0, 0)?;
+		let last_removed = header.last_removed();
+		let mut filled = header.filled();
 		if filled == 0 {
 			filled = 1;
 		}
@@ -778,12 +796,12 @@ impl ValueTable {
 	pub fn complete_plan(&self, log: &mut LogWriter) -> Result<()> {
 		if let Ok(true) = self.dirty_header.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed) {
 			// last_removed or filled pointers were modified. Add them to the log
-			let mut buf = [0u8; 16];
+			let mut buf = Header::default();
 			let last_removed = self.last_removed.load(Ordering::Relaxed);
 			let filled = self.filled.load(Ordering::Relaxed);
-			buf[0..INDEX_SIZE].copy_from_slice(&last_removed.to_le_bytes());
-			buf[INDEX_SIZE..INDEX_SIZE * 2].copy_from_slice(&filled.to_le_bytes());
-			log.insert_value(self.id, 0, buf.to_vec());
+			buf.set_last_removed(last_removed);
+			buf.set_filled(filled);
+			log.insert_value(self.id, 0, buf.0.to_vec());
 		}
 		Ok(())
 	}
