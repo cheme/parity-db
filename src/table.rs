@@ -184,16 +184,45 @@ impl Entry {
 	fn is_multipart(&self) -> bool {
 		&self.1[0..SIZE_SIZE] == MULTIPART
 	}
+	fn write_multipart(&mut self) {
+		self.1[0..SIZE_SIZE].copy_from_slice(&MULTIPART);
+		self.0 = SIZE_SIZE;
+	}
+	fn write_size(&mut self, size: u16) {
+		self.1[0..SIZE_SIZE].copy_from_slice(&size.to_le_bytes());
+		self.0 = SIZE_SIZE;
+	}
+	fn write_next(&mut self, next_index: u64) {
+		let start = self.0;
+		self.0 += INDEX_SIZE;
+		self.1[start..self.0].copy_from_slice(&next_index.to_le_bytes());
+	}
 	fn size(&self) -> u16 {
-		u16::from_le_bytes(self.1[0..SIZE_SIZE].try_into().unwrap())
+		Self::entry_size(&self.1)
+	}
+	fn entry_size(buf: &[u8]) -> u16 {
+		u16::from_le_bytes(buf[0..SIZE_SIZE].try_into().unwrap())
 	}
 	fn next(&self) -> u64 {
-		u64::from_le_bytes(self.1[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].try_into().unwrap())
+		Self::entry_next(&self.1)
+	}
+	fn entry_next(buf: &[u8]) -> u64 {
+		u64::from_le_bytes(buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].try_into().unwrap())
 	}
 	fn read_rc(&mut self) -> u32 {
 		let start = self.0;
 		self.0 += REFS_SIZE;
 		u32::from_le_bytes(self.1[start..self.0].try_into().unwrap())
+	}
+	fn write_rc(&mut self, rc: u32) {
+		let start = self.0;
+		self.0 += REFS_SIZE;
+		self.1[start..self.0].copy_from_slice(&rc.to_le_bytes());
+	}
+	fn write_slice(&mut self, buf: &[u8]) {
+		let start = self.0;
+		self.0 += buf.len();
+		self.1[start..self.0].copy_from_slice(buf);
 	}
 	fn read_varint(&mut self) -> u64 {
 		let (stored_len, enc_len) = crate::varint_decode(&self.1[self.0..]);
@@ -484,11 +513,11 @@ impl ValueTable {
 	pub fn read_next_free(&self, index: u64, log: &LogWriter) -> Result<u64> {
 		let mut buf: [u8; 10] = unsafe { MaybeUninit::uninit().assume_init() };
 		if log.value(self.id, index, &mut buf) {
-			let next = u64::from_le_bytes(buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].try_into().unwrap());
+			let next = Entry::entry_next(&buf);
 			return Ok(next);
 		}
 		self.read_at(&mut buf, index * self.entry_size as u64)?;
-		let next = u64::from_le_bytes(buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].try_into().unwrap());
+		let next = Entry::entry_next(&buf);
 		return Ok(next);
 	}
 
@@ -496,14 +525,14 @@ impl ValueTable {
 		let mut buf: [u8; 10] = unsafe { MaybeUninit::uninit().assume_init() };
 		if log.value(self.id, index, &mut buf) {
 			if &buf[0..SIZE_SIZE] == MULTIPART {
-				let next = u64::from_le_bytes(buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].try_into().unwrap());
+				let next = Entry::entry_next(&buf);
 				return Ok(Some(next));
 			}
 			return Ok(None);
 		}
 		self.read_at(&mut buf, index * self.entry_size as u64)?;
 		if &buf[0..SIZE_SIZE] == MULTIPART {
-			let next = u64::from_le_bytes(buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].try_into().unwrap());
+			let next = Entry::entry_next(&buf);
 			return Ok(Some(next));
 		}
 		return Ok(None);
@@ -578,71 +607,61 @@ impl ValueTable {
 				index,
 				hex(key),
 			);
-			let mut buf: [u8; MAX_ENTRY_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
+			let mut buf = Entry::new();
 			let free_space = self.entry_size as usize - SIZE_SIZE;
 			let (target_offset, value_len) = if remainder > free_space {
 				if !follow {
 					next_index = self.next_free(log)?
 				}
-				buf[0..SIZE_SIZE].copy_from_slice(&MULTIPART);
-				buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].copy_from_slice(&(next_index as u64).to_le_bytes());
+				buf.write_multipart();
+				buf.write_next(next_index);
 				(10, free_space - INDEX_SIZE)
 			} else {
-				buf[0..SIZE_SIZE].copy_from_slice(&(remainder as u16).to_le_bytes());
+				buf.write_size(remainder as u16);
 				(SIZE_SIZE, remainder)
 			};
-			let written = if offset == 0 && key_remaining > 0 {
-				let init_offset = target_offset;
-				let target_offset = if key_remaining == encoded_key_len {
+			let init_offset = buf.offset();
+			if offset == 0 && key_remaining > 0 {
+				if key_remaining == encoded_key_len {
 					// first rc.
 					let rc = if compressed {
 						1u32 | COMPRESSED_MASK
 					} else {
 						1u32
 					};
-					buf[target_offset..target_offset + REFS_SIZE].copy_from_slice(&rc.to_le_bytes());
-					let target_offset = target_offset + REFS_SIZE;
+					buf.write_rc(rc);
 					if self.attach_key {
 						let mut buf_len = [0u8; 10];
 						let encoded = crate::varint_encode(key.len() as u64, &mut buf_len);
-						buf[target_offset..target_offset + encoded.len()].copy_from_slice(encoded);
+						buf.write_slice(encoded);
 						key_remaining -= encoded.len();
-						target_offset + encoded.len()
 					} else if self.no_indexing {
 						key_remaining = 0;
-						target_offset
 					} else {
-						buf[target_offset..target_offset + PARTIAL_SIZE].copy_from_slice(key.table_slice());
+						buf.write_slice(key.table_slice());
 						key_remaining = 0;
-						target_offset + PARTIAL_SIZE
 					}
-				} else {
-					target_offset
-				};
+				}
 				if self.attach_key {
-					let mut upper = target_offset + key_remaining;
+					let mut upper = buf.offset() + key_remaining;
 					let key_start = key.table_slice().len() - key_remaining;
 					if (self.entry_size as usize) < upper {
 						upper = self.entry_size as usize;
-						buf[target_offset..upper].copy_from_slice(&key.table_slice()[key_start..key_start + upper - target_offset]);
-						key_remaining -= upper - target_offset;
+						let to_write = upper - buf.offset();
+						buf.write_slice(&key.table_slice()[key_start..key_start + to_write]);
+						key_remaining -= to_write;
 					} else {
-						buf[target_offset..upper].copy_from_slice(&key.table_slice()[key_start..]);
+						buf.write_slice(&key.table_slice()[key_start..]);
 						key_remaining = 0;
 					};
-					upper - init_offset
-				} else {
-					target_offset - init_offset
 				}
-			} else {
-				0
-			};
+			}
 			if key_remaining == 0 {
-				buf[target_offset + written..target_offset + value_len]
-					.copy_from_slice(&value[offset..offset + value_len - written]);
+				let written = buf.offset() - init_offset;
+				buf.write_slice(&value[offset..offset + value_len - written]);
 				offset += value_len - written;
 			}
-			log.insert_value(self.id, index, buf[0..target_offset + value_len].to_vec());
+			log.insert_value(self.id, index, buf.1[0..target_offset + value_len].to_vec());
 			remainder -= value_len;
 			index = next_index;
 			if remainder == 0 {
