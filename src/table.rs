@@ -71,6 +71,10 @@ use crate::{
 pub const SIZE_TIERS: usize = 16;
 pub const SIZE_TIERS_BITS: u8 = 4;
 const MAX_ENTRY_SIZE: usize = 0xfffd;
+const REFS_SIZE: usize = 4;
+const SIZE_SIZE: usize = 2;
+const PARTIAL_SIZE: usize = 26;
+const INDEX_SIZE: usize = 8;
 
 const TOMBSTONE: &[u8] = &[0xff, 0xff];
 const MULTIPART: &[u8] = &[0xff, 0xfe];
@@ -167,8 +171,8 @@ impl ValueTable {
 		let capacity = file_len / entry_size as u64;
 		let mut header: [u8; 16] = Default::default();
 		file.read_exact(&mut header)?;
-		let last_removed = u64::from_le_bytes(header[0..8].try_into().unwrap());
-		let mut filled = u64::from_le_bytes(header[8..16].try_into().unwrap());
+		let last_removed = u64::from_le_bytes(header[0..INDEX_SIZE].try_into().unwrap());
+		let mut filled = u64::from_le_bytes(header[INDEX_SIZE..INDEX_SIZE * 2].try_into().unwrap());
 		if filled == 0 {
 			filled = 1;
 		}
@@ -188,12 +192,11 @@ impl ValueTable {
 	}
 
 	pub fn value_size(&self) -> u16 {
-		// SIZE + REFS + KEY = KEY_LEN
 		if self.attach_key || self.no_indexing {
 			// key size in entry size or no key
-			self.entry_size + (KEY_LEN - 26) as u16
+			self.entry_size - SIZE_SIZE as u16 - REFS_SIZE as u16
 		} else {
-			self.entry_size - KEY_LEN as u16
+			self.entry_size - SIZE_SIZE as u16 - REFS_SIZE as u16 - PARTIAL_SIZE as u16
 		}
 	}
 
@@ -260,23 +263,23 @@ impl ValueTable {
 				&buf[0..entry_size]
 			};
 
-			if &buf[0..2] == TOMBSTONE {
+			if &buf[0..SIZE_SIZE] == TOMBSTONE {
 				return Ok((false, false));
 			}
 
-			let (content_offset, end_entry, next) = if &buf[0..2] == MULTIPART {
-				let next = u64::from_le_bytes(buf[2..10].try_into().unwrap());
-				(10, entry_size, next)
+			let (content_offset, end_entry, next) = if &buf[0..SIZE_SIZE] == MULTIPART {
+				let next = u64::from_le_bytes(buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].try_into().unwrap());
+				(SIZE_SIZE + INDEX_SIZE, entry_size, next)
 			} else {
-				let size: u16 = u16::from_le_bytes(buf[0..2].try_into().unwrap());
-				(2, size as usize + 2, 0)
+				let size: u16 = u16::from_le_bytes(buf[0..SIZE_SIZE].try_into().unwrap());
+				(SIZE_SIZE, size as usize + SIZE_SIZE, 0)
 			};
 
 			if part == 0 || (self.attach_key && queried_key_offset != queried_key_len) {
 				let content_offset = if queried_key_offset == 0 {
-					let rc = u32::from_le_bytes(buf[content_offset..content_offset + 4].try_into().unwrap());
+					let rc = u32::from_le_bytes(buf[content_offset..content_offset + REFS_SIZE].try_into().unwrap());
 					compressed = rc & COMPRESSED_MASK > 0;
-					content_offset + 4
+					content_offset + REFS_SIZE
 				} else {
 					content_offset
 				};
@@ -316,10 +319,10 @@ impl ValueTable {
 					}
 				} else if self.no_indexing {
 					(true, content_offset, content_offset)
-				} else if key.table_slice() != &buf[content_offset..content_offset + 26] {
-					(false, content_offset, content_offset + 26)
+				} else if key.table_slice() != &buf[content_offset..content_offset + PARTIAL_SIZE] {
+					(false, content_offset, content_offset + PARTIAL_SIZE)
 				} else {
-					(true, content_offset, content_offset + 26)
+					(true, content_offset, content_offset + PARTIAL_SIZE)
 				};
 				if !matched {
 					log::debug!(
@@ -395,10 +398,10 @@ impl ValueTable {
 			self.read_at(&mut buf[0..40], index * self.entry_size as u64)?;
 			&buf
 		};
-		if &buf[0..2] == TOMBSTONE {
+		if &buf[0..SIZE_SIZE] == TOMBSTONE {
 			return Ok(None);
 		}
-		if &buf[0..2] == MULTIPART {
+		if &buf[0..SIZE_SIZE] == MULTIPART {
 			result[6..].copy_from_slice(&buf[14..40]);
 		} else {
 			result[6..].copy_from_slice(&buf[6..32]);
@@ -409,26 +412,26 @@ impl ValueTable {
 	pub fn read_next_free(&self, index: u64, log: &LogWriter) -> Result<u64> {
 		let mut buf: [u8; 10] = unsafe { MaybeUninit::uninit().assume_init() };
 		if log.value(self.id, index, &mut buf) {
-			let next = u64::from_le_bytes(buf[2..10].try_into().unwrap());
+			let next = u64::from_le_bytes(buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].try_into().unwrap());
 			return Ok(next);
 		}
 		self.read_at(&mut buf, index * self.entry_size as u64)?;
-		let next = u64::from_le_bytes(buf[2..10].try_into().unwrap());
+		let next = u64::from_le_bytes(buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].try_into().unwrap());
 		return Ok(next);
 	}
 
 	pub fn read_next_part(&self, index: u64, log: &LogWriter) -> Result<Option<u64>> {
 		let mut buf: [u8; 10] = unsafe { MaybeUninit::uninit().assume_init() };
 		if log.value(self.id, index, &mut buf) {
-			if &buf[0..2] == MULTIPART {
-				let next = u64::from_le_bytes(buf[2..10].try_into().unwrap());
+			if &buf[0..SIZE_SIZE] == MULTIPART {
+				let next = u64::from_le_bytes(buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].try_into().unwrap());
 				return Ok(Some(next));
 			}
 			return Ok(None);
 		}
 		self.read_at(&mut buf, index * self.entry_size as u64)?;
-		if &buf[0..2] == MULTIPART {
-			let next = u64::from_le_bytes(buf[2..10].try_into().unwrap());
+		if &buf[0..SIZE_SIZE] == MULTIPART {
+			let next = u64::from_le_bytes(buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].try_into().unwrap());
 			return Ok(Some(next));
 		}
 		return Ok(None);
@@ -464,12 +467,12 @@ impl ValueTable {
 	fn overwrite_chain(&self, key: &Key, value: &[u8], log: &mut LogWriter, at: Option<u64>, compressed: bool) -> Result<u64> {
 		let encoded_key_len = key.encoded_len();
 		let mut key_remaining = encoded_key_len;
-		let mut remainder = value.len() + 4 + if self.attach_key {
+		let mut remainder = value.len() + REFS_SIZE + if self.attach_key {
 			key_remaining
 		} else if self.no_indexing {
 			0
 		} else {
-			26
+			PARTIAL_SIZE
 		}; // Prefix with key and ref counter
 		let mut offset = 0;
 		let mut start = 0;
@@ -504,17 +507,17 @@ impl ValueTable {
 				hex(key),
 			);
 			let mut buf: [u8; MAX_ENTRY_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
-			let free_space = self.entry_size as usize - 2;
+			let free_space = self.entry_size as usize - SIZE_SIZE;
 			let (target_offset, value_len) = if remainder > free_space {
 				if !follow {
 					next_index = self.next_free(log)?
 				}
-				buf[0..2].copy_from_slice(&MULTIPART);
-				buf[2..10].copy_from_slice(&(next_index as u64).to_le_bytes());
-				(10, free_space - 8)
+				buf[0..SIZE_SIZE].copy_from_slice(&MULTIPART);
+				buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].copy_from_slice(&(next_index as u64).to_le_bytes());
+				(10, free_space - INDEX_SIZE)
 			} else {
-				buf[0..2].copy_from_slice(&(remainder as u16).to_le_bytes());
-				(2, remainder)
+				buf[0..SIZE_SIZE].copy_from_slice(&(remainder as u16).to_le_bytes());
+				(SIZE_SIZE, remainder)
 			};
 			let written = if offset == 0 && key_remaining > 0 {
 				let init_offset = target_offset;
@@ -525,8 +528,8 @@ impl ValueTable {
 					} else {
 						1u32
 					};
-					buf[target_offset..target_offset + 4].copy_from_slice(&rc.to_le_bytes());
-					let target_offset = target_offset + 4;
+					buf[target_offset..target_offset + REFS_SIZE].copy_from_slice(&rc.to_le_bytes());
+					let target_offset = target_offset + REFS_SIZE;
 					if self.attach_key {
 						let mut buf_len = [0u8; 10];
 						let encoded = crate::varint_encode(key.len() as u64, &mut buf_len);
@@ -537,9 +540,9 @@ impl ValueTable {
 						key_remaining = 0;
 						target_offset
 					} else {
-						buf[target_offset..target_offset + 26].copy_from_slice(key.table_slice());
+						buf[target_offset..target_offset + PARTIAL_SIZE].copy_from_slice(key.table_slice());
 						key_remaining = 0;
-						target_offset + 26
+						target_offset + PARTIAL_SIZE
 					}
 				} else {
 					target_offset
@@ -606,8 +609,8 @@ impl ValueTable {
 			index,
 		);
 		let mut buf = [0u8; 10];
-		&buf[0..2].copy_from_slice(TOMBSTONE);
-		&buf[2..10].copy_from_slice(&last_removed.to_le_bytes());
+		&buf[0..SIZE_SIZE].copy_from_slice(TOMBSTONE);
+		&buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].copy_from_slice(&last_removed.to_le_bytes());
 
 		log.insert_value(self.id, index, buf.to_vec());
 		self.last_removed.store(index, Ordering::Relaxed);
@@ -655,18 +658,18 @@ impl ValueTable {
 			&mut buf[0..self.entry_size as usize]
 		};
 
-		if &buf[0..2] == TOMBSTONE {
+		if &buf[0..SIZE_SIZE] == TOMBSTONE {
 			return Ok(false);
 		}
 
-		let (counter_offset, size) = if &buf[0..2] == MULTIPART {
+		let (counter_offset, size) = if &buf[0..SIZE_SIZE] == MULTIPART {
 			(10, self.entry_size as usize)
 		} else {
-			let size: u16 = u16::from_le_bytes(buf[0..2].try_into().unwrap());
-			(2, (size + 2) as usize)
+			let size: u16 = u16::from_le_bytes(buf[0..SIZE_SIZE].try_into().unwrap());
+			(SIZE_SIZE, size as usize + SIZE_SIZE)
 		};
 
-		let mut counter: u32 = u32::from_le_bytes(buf[counter_offset..counter_offset + 4].try_into().unwrap());
+		let mut counter: u32 = u32::from_le_bytes(buf[counter_offset..counter_offset + REFS_SIZE].try_into().unwrap());
 		debug_assert!(compressed.map(|compressed| if counter & COMPRESSED_MASK > 0 {
 				compressed == true
 			} else {
@@ -714,20 +717,20 @@ impl ValueTable {
 		}
 
 		let mut buf: [u8; MAX_ENTRY_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
-		log.read(&mut buf[0..2])?;
-		if &buf[0..2] == TOMBSTONE {
-			log.read(&mut buf[2..10])?;
+		log.read(&mut buf[0..SIZE_SIZE])?;
+		if &buf[0..SIZE_SIZE] == TOMBSTONE {
+			log.read(&mut buf[SIZE_SIZE..10])?;
 			self.write_at(&buf[0..10], index * (self.entry_size as u64))?;
 			log::trace!(target: "parity-db", "{}: Enacted tombstone in slot {}", self.id, index);
-		} else if &buf[0..2] == MULTIPART {
+		} else if &buf[0..SIZE_SIZE] == MULTIPART {
 				let entry_size = self.entry_size as usize;
-				log.read(&mut buf[2..entry_size])?;
+				log.read(&mut buf[SIZE_SIZE..entry_size])?;
 				self.write_at(&buf[0..entry_size], index * (entry_size as u64))?;
 				log::trace!(target: "parity-db", "{}: Enacted multipart in slot {}", self.id, index);
 		} else {
-			let len: u16 = u16::from_le_bytes(buf[0..2].try_into().unwrap());
-			log.read(&mut buf[2..2+len as usize])?;
-			self.write_at(&buf[0..(2 + len as usize)], index * (self.entry_size as u64))?;
+			let len: u16 = u16::from_le_bytes(buf[0..SIZE_SIZE].try_into().unwrap());
+			log.read(&mut buf[SIZE_SIZE..SIZE_SIZE + len as usize])?;
+			self.write_at(&buf[0..(SIZE_SIZE + len as usize)], index * (self.entry_size as u64))?;
 			log::trace!(target: "parity-db", "{}: Enacted {}: {}, {} bytes", self.id, index, hex(&buf[6..32]), len);
 		}
 		Ok(())
@@ -741,20 +744,20 @@ impl ValueTable {
 			return Ok(());
 		}
 		let mut buf: [u8; MAX_ENTRY_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
-		log.read(&mut buf[0..2])?;
-		if &buf[0..2] == TOMBSTONE {
-			log.read(&mut buf[2..10])?;
+		log.read(&mut buf[0..SIZE_SIZE])?;
+		if &buf[0..SIZE_SIZE] == TOMBSTONE {
+			log.read(&mut buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE])?;
 			log::trace!(target: "parity-db", "{}: Validated tombstone in slot {}", self.id, index);
 		}
-		else if &buf[0..2] == MULTIPART {
+		else if &buf[0..SIZE_SIZE] == MULTIPART {
 			let entry_size = self.entry_size as usize;
-			log.read(&mut buf[2..entry_size])?;
+			log.read(&mut buf[SIZE_SIZE..entry_size])?;
 			log::trace!(target: "parity-db", "{}: Validated multipart in slot {}", self.id, index);
 		} else {
 			// TODO: check len
-			let len: u16 = u16::from_le_bytes(buf[0..2].try_into().unwrap());
-			log.read(&mut buf[2..2 + len as usize])?;
-			log::trace!(target: "parity-db", "{}: Validated {}: {}, {} bytes", self.id, index, hex(&buf[2..32]), len);
+			let len: u16 = u16::from_le_bytes(buf[0..SIZE_SIZE].try_into().unwrap());
+			log.read(&mut buf[SIZE_SIZE..SIZE_SIZE + len as usize])?;
+			log::trace!(target: "parity-db", "{}: Validated {}: {}, {} bytes", self.id, index, hex(&buf[SIZE_SIZE..32]), len);
 		}
 		Ok(())
 	}
@@ -762,8 +765,8 @@ impl ValueTable {
 	pub fn refresh_metadata(&self) -> Result<()> {
 		let mut header: [u8; 16] = Default::default();
 		self.read_at(&mut header, 0)?;
-		let last_removed = u64::from_le_bytes(header[0..8].try_into().unwrap());
-		let mut filled = u64::from_le_bytes(header[8..16].try_into().unwrap());
+		let last_removed = u64::from_le_bytes(header[0..INDEX_SIZE].try_into().unwrap());
+		let mut filled = u64::from_le_bytes(header[INDEX_SIZE..INDEX_SIZE * 2].try_into().unwrap());
 		if filled == 0 {
 			filled = 1;
 		}
@@ -778,8 +781,8 @@ impl ValueTable {
 			let mut buf = [0u8; 16];
 			let last_removed = self.last_removed.load(Ordering::Relaxed);
 			let filled = self.filled.load(Ordering::Relaxed);
-			buf[0..8].copy_from_slice(&last_removed.to_le_bytes());
-			buf[8..16].copy_from_slice(&filled.to_le_bytes());
+			buf[0..INDEX_SIZE].copy_from_slice(&last_removed.to_le_bytes());
+			buf[INDEX_SIZE..INDEX_SIZE * 2].copy_from_slice(&filled.to_le_bytes());
 			log.insert_value(self.id, 0, buf.to_vec());
 		}
 		Ok(())
