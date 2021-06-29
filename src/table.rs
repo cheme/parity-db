@@ -165,6 +165,56 @@ impl Header {
 	}
 }
 
+struct Entry(usize, [u8; MAX_ENTRY_SIZE]);
+
+impl Entry {
+	#[inline(always)]
+	fn new() -> Self {
+		Entry(0, unsafe { MaybeUninit::uninit().assume_init() })
+	}
+	fn set_offset(&mut self, offset: usize) {
+		self.0 = offset;
+	}
+	fn offset(&self) -> usize {
+		self.0
+	}
+	fn is_tombstone(&self) -> bool {
+		&self.1[0..SIZE_SIZE] == TOMBSTONE
+	}
+	fn is_multipart(&self) -> bool {
+		&self.1[0..SIZE_SIZE] == MULTIPART
+	}
+	fn size(&self) -> u16 {
+		u16::from_le_bytes(self.1[0..SIZE_SIZE].try_into().unwrap())
+	}
+	fn next(&self) -> u64 {
+		u64::from_le_bytes(self.1[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].try_into().unwrap())
+	}
+	fn read_rc(&mut self) -> u32 {
+		let start = self.0;
+		self.0 += REFS_SIZE;
+		u32::from_le_bytes(self.1[start..self.0].try_into().unwrap())
+	}
+	fn read_varint(&mut self) -> u64 {
+		let (stored_len, enc_len) = crate::varint_decode(&self.1[self.0..]);
+		self.0 += enc_len;
+		stored_len
+	}
+	fn read_partial(&mut self) -> &[u8] {
+		let start = self.0;
+		self.0 += PARTIAL_SIZE;
+		&self.1[start..self.0]
+	}
+	fn remaining_to(&self, end: usize) -> &[u8] {
+		&self.1[self.0..end]
+	}
+	fn read_remaining_to(&mut self, end: usize) -> &[u8] {
+		let start = self.0;
+		self.0 = end;
+		&self.1[start..self.0]
+	}
+}
+
 impl ValueTable {
 	pub fn open(path: &std::path::Path, id: TableId, entry_size: Option<u16>, options: &Options) -> Result<ValueTable> {
 		let (multipart, entry_size) = match entry_size {
@@ -260,7 +310,7 @@ impl ValueTable {
 		log: &Q,
 		mut f: F,
 	) -> Result<(bool, bool)> {
-		let mut buf: [u8; MAX_ENTRY_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
+		let mut buf = Entry::new();
 
 		let mut part = 0;
 		let mut compressed = false;
@@ -268,8 +318,8 @@ impl ValueTable {
 		let mut queried_key_offset = 0;
 		let queried_key_len = key.table_slice().len();
 		loop {
-			let buf = if log.value(self.id, index, &mut buf) {
-				&buf
+			let buf = if log.value(self.id, index, &mut buf.1) {
+				&mut buf
 			} else {
 				log::trace!(
 					target: "parity-db",
@@ -277,49 +327,51 @@ impl ValueTable {
 					self.id,
 					index,
 				);
-				self.read_at(&mut buf[0..entry_size], index * self.entry_size as u64)?;
-				&buf[0..entry_size]
+				self.read_at(&mut buf.1[0..entry_size], index * self.entry_size as u64)?;
+				&mut buf
 			};
 
-			if &buf[0..SIZE_SIZE] == TOMBSTONE {
+			if buf.is_tombstone() {
 				return Ok((false, false));
 			}
 
-			let (content_offset, end_entry, next) = if &buf[0..SIZE_SIZE] == MULTIPART {
-				let next = u64::from_le_bytes(buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].try_into().unwrap());
+			let (content_offset, end_entry, next) = if buf.is_multipart() {
+				let next = buf.next();
 				(SIZE_SIZE + INDEX_SIZE, entry_size, next)
 			} else {
-				let size: u16 = u16::from_le_bytes(buf[0..SIZE_SIZE].try_into().unwrap());
+				let size = buf.size();
 				(SIZE_SIZE, size as usize + SIZE_SIZE, 0)
 			};
 
+			buf.set_offset(content_offset);
+
 			if part == 0 || (self.attach_key && queried_key_offset != queried_key_len) {
-				let content_offset = if queried_key_offset == 0 {
-					let rc = u32::from_le_bytes(buf[content_offset..content_offset + REFS_SIZE].try_into().unwrap());
+				if queried_key_offset == 0 {
+					let rc = buf.read_rc();
 					compressed = rc & COMPRESSED_MASK > 0;
-					content_offset + REFS_SIZE
-				} else {
-					content_offset
-				};
-				let (matched, content_offset, offset_value) = if self.attach_key {
-					let (matched_len, content_offset, upper) = if queried_key_offset == 0 {
+				}
+				let mut key_range = 0..0;
+				let matched = if self.attach_key {
+					let (matched_len, upper) = if queried_key_offset == 0 {
 						// read len
-						let (stored_len, enc_len) = crate::varint_decode(&buf[content_offset..]);
-						let upper = content_offset + enc_len + stored_len as usize;
+						let stored_len = buf.read_varint();
+						let upper = buf.offset() + stored_len as usize;
 						if stored_len != queried_key_len as u64 {
-							(false, content_offset + enc_len, upper)
+							(false, upper)
 						} else {
-							(true, content_offset + enc_len, upper)
+							(true, upper)
 						}
 					} else {
 						let remaining = queried_key_len - queried_key_offset as usize;
-						(true, content_offset, content_offset + remaining)
+						(true, content_offset + remaining)
 					};
+					key_range.start = buf.offset();
 					if upper > entry_size {
 						// key over multiple part.
-						let upper_key = queried_key_offset + (entry_size - content_offset) as usize;
-						if !matched_len || &key.table_slice()[queried_key_offset..upper_key] != &buf[content_offset..entry_size] {
-							(false, content_offset, entry_size)
+						let upper_key = queried_key_offset + (entry_size - buf.offset()) as usize;
+						if !matched_len || &key.table_slice()[queried_key_offset..upper_key] != buf.read_remaining_to(entry_size) {
+							key_range.end = buf.offset();
+							false
 						} else {
 							queried_key_offset = upper_key;
 							part += 1;
@@ -329,18 +381,20 @@ impl ValueTable {
 							index = next;
 							continue;
 						}
-					} else if !matched_len || &key.table_slice()[queried_key_offset..] != &buf[content_offset..upper] {
-						(false, content_offset, upper)
+					} else if !matched_len || &key.table_slice()[queried_key_offset..] != buf.read_remaining_to(upper) {
+						key_range.end = buf.offset();
+						false
 					} else {
 						queried_key_offset = queried_key_len;
-						(true, content_offset, upper)
+						true
 					}
 				} else if self.no_indexing {
-					(true, content_offset, content_offset)
-				} else if key.table_slice() != &buf[content_offset..content_offset + PARTIAL_SIZE] {
-					(false, content_offset, content_offset + PARTIAL_SIZE)
+					true
+				} else if key.table_slice() != buf.read_partial() {
+					key_range.end = buf.offset();
+					false
 				} else {
-					(true, content_offset, content_offset + PARTIAL_SIZE)
+					true
 				};
 				if !matched {
 					log::debug!(
@@ -349,15 +403,15 @@ impl ValueTable {
 						self.id,
 						index,
 						hex(key.table_slice()),
-						hex(&buf[content_offset..offset_value]),
+						hex(&buf.1[key_range]),
 					);
 					return Ok((false, false));
 				}
-				if !f(&buf[offset_value..end_entry]) {
+				if !f(buf.remaining_to(end_entry)) {
 					break;
 				};
 			} else {
-				if !f(&buf[content_offset..end_entry]) {
+				if !f(buf.remaining_to(end_entry)) {
 					break;
 				};
 			}
