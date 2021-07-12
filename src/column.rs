@@ -544,16 +544,7 @@ impl Column {
 						let mut key = [0u8; crate::KEY_LEN];
 						// restore 16 high bits
 						&mut key[0..8].copy_from_slice(&index_key.to_be_bytes());
-						let address = entry.address(source.id.index_bits());
-						if let Some(partial_key) = tables.value[address.size_tier() as usize]
-							.partial_key_at(address.offset(), &*log.overlays())? {
-							&mut key[6..].copy_from_slice(&partial_key[6..]);
-							log::trace!(target: "parity-db", "{}: Reinserting {}", source.id, hex(&key));
-							// TODO with key variant
-							plan.push((Key::Hash(key), entry.address(source.id.index_bits())))
-						} else {
-							log::error!(target: "parity-db", "Missing value for reindexing {}, {}", source.id, hex(&key));
-						}
+						plan.push((Key::Hash(key), entry.address(source.id.index_bits())))
 					}
 					count += 1;
 					source_index += 1;

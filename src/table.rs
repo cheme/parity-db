@@ -127,6 +127,7 @@ pub struct ValueTable {
 	filled: AtomicU64,
 	last_removed: AtomicU64,
 	dirty_header: AtomicBool,
+	dirty: AtomicBool,
 	multipart: bool,
 	attach_key: bool,
 	no_indexing: bool,
@@ -282,6 +283,7 @@ impl ValueTable {
 			filled: AtomicU64::new(filled),
 			last_removed: AtomicU64::new(last_removed),
 			dirty_header: AtomicBool::new(false),
+			dirty: AtomicBool::new(false),
 			multipart,
 			attach_key: options.attach_key,
 			no_indexing: options.no_indexing,
@@ -306,6 +308,7 @@ impl ValueTable {
 	#[cfg(unix)]
 	fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
 		use std::os::unix::fs::FileExt;
+		self.dirty.store(true, Ordering::Relaxed);
 		Ok(self.file.write_all_at(buf, offset)?)
 	}
 
@@ -319,6 +322,7 @@ impl ValueTable {
 	#[cfg(windows)]
 	fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
 		use std::os::windows::fs::FileExt;
+		self.dirty.store(true, Ordering::Relaxed);
 		self.file.seek_write(buf, offset)?;
 		Ok(())
 	}
@@ -780,7 +784,7 @@ impl ValueTable {
 			}
 		} else {
 			if counter != LOCKED_REF {
-				counter = counter.saturating_sub((delta * -1) as u32);
+				counter = counter.saturating_sub(-delta as u32);
 				if counter == 0 {
 					return Ok(false);
 				}
@@ -789,7 +793,7 @@ impl ValueTable {
 		counter = if compressed {
 			counter | COMPRESSED_MASK
 		} else {
-			LOCKED_REF
+			counter
 		};
 
 		buf.set_offset(counter_offset);
@@ -883,7 +887,9 @@ impl ValueTable {
 	}
 
 	pub fn flush(&self) -> Result<()> {
-		self.file.sync_data()?;
+		if let Ok(true) = self.dirty.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed) {
+			self.file.sync_data()?;
+		}
 		Ok(())
 	}
 }
@@ -933,12 +939,12 @@ mod test {
 	fn write_ops<F: FnOnce(&mut LogWriter)>(table: &ValueTable, log: &Log, f: F) {
 		let mut writer = log.begin_record();
 		f(&mut writer);
-		log.end_record(writer.drain()).unwrap();
+		let bytes_written = log.end_record(writer.drain()).unwrap();
 		// Cycle through 2 log files
 		let _ = log.read_next(false);
-		log.flush_one(|| Ok(())).unwrap();
+		log.flush_one(0, || Ok(())).unwrap();
 		let _ = log.read_next(false);
-		log.flush_one(|| Ok(())).unwrap();
+		log.flush_one(0, || Ok(())).unwrap();
 		let mut reader = log.read_next(false).unwrap().unwrap();
 		loop {
 			match reader.next().unwrap() {
@@ -946,6 +952,8 @@ mod test {
 					panic!("Unexpected log entry");
 				},
 				LogAction::EndRecord => {
+					let bytes_read = reader.read_bytes();
+					assert_eq!(bytes_written, bytes_read);
 					break;
 				},
 				LogAction::InsertValue(insertion) => {
@@ -1189,14 +1197,40 @@ mod test {
 		ref_counting_inner(&no_indexing());
 	}
 	fn ref_counting_inner(options: &ColumnOptions) {
-		let dir = TempDir::new("ref_counting");
-		let table = dir.table(None, options);
+		for compressed in [false, true] {
+			let dir = TempDir::new("ref_counting");
+			let table = dir.table(None, options);
+			let log = dir.log();
+
+			let key = key(1, options);
+			let val = value(5000);
+			write_ops(&table, &log, |writer| {
+				table.write_insert_plan(&key, &val, writer, compressed).unwrap();
+				table.write_inc_ref(1, writer, compressed).unwrap();
+			});
+			assert_eq!(table.get(&key, 1, log.overlays()).unwrap(), Some((val.clone(), compressed)));
+			write_ops(&table, &log, |writer| {
+				table.write_dec_ref(1, writer).unwrap();
+			});
+			assert_eq!(table.get(&key, 1, log.overlays()).unwrap(), Some((val, compressed)));
+			write_ops(&table, &log, |writer| {
+				table.write_dec_ref(1, writer).unwrap();
+			});
+			assert_eq!(table.get(&key, 1, log.overlays()).unwrap(), None);
+		}
+	}
+
+	#[test]
+	fn ref_underflow() {
+		let options = &ColumnOptions::default();
+		let dir = TempDir::new("ref_underflow");
+		let table = dir.table(None, &options);
 		let log = dir.log();
 
-		let key = key(1, options);
-		let val = value(5000);
+		let key = key(1, &options);
+		let val = value(10);
 
-		let compressed = true;
+		let compressed = false;
 		write_ops(&table, &log, |writer| {
 			table.write_insert_plan(&key, &val, writer, compressed).unwrap();
 			table.write_inc_ref(1, writer, compressed).unwrap();
@@ -1204,9 +1238,7 @@ mod test {
 		assert_eq!(table.get(&key, 1, log.overlays()).unwrap(), Some((val.clone(), compressed)));
 		write_ops(&table, &log, |writer| {
 			table.write_dec_ref(1, writer).unwrap();
-		});
-		assert_eq!(table.get(&key, 1, log.overlays()).unwrap(), Some((val, compressed)));
-		write_ops(&table, &log, |writer| {
+			table.write_dec_ref(1, writer).unwrap();
 			table.write_dec_ref(1, writer).unwrap();
 		});
 		assert_eq!(table.get(&key, 1, log.overlays()).unwrap(), None);
