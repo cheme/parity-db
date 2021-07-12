@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write, Seek};
 use std::convert::TryInto;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use parking_lot::{Condvar, Mutex, RwLock, RwLockWriteGuard};
 use crate::{
 	error::{Error, Result},
@@ -348,7 +349,7 @@ enum ReadingState {
 }
 
 pub struct Log {
-	overlays: RwLock<LogOverlays>,
+	pub(crate) overlays: Arc<RwLock<LogOverlays>>,
 	appending: RwLock<Appending>,
 	reading: RwLock<std::io::BufReader<std::fs::File>>,
 	reading_state: Mutex<ReadingState>,

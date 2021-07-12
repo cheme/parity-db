@@ -108,6 +108,10 @@ impl TableId {
 		format!("table_{:02}_{}", self.col(), self.size_tier())
 	}
 
+	pub fn index_file_name(&self) -> String {
+		format!("ordered_index_{:02}_{}", self.col(), self.size_tier())
+	}
+
 	pub fn as_u16(&self) -> u16 {
 		self.0
 	}
@@ -260,6 +264,12 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> Entry<B> {
 
 impl ValueTable {
 	pub fn open(path: &std::path::Path, id: TableId, entry_size: Option<u16>, options: &Options) -> Result<ValueTable> {
+		Self::open_inner(path, id, entry_size, options, false)
+	}
+	pub fn open_index(path: &std::path::Path, id: TableId, entry_size: Option<u16>, options: &Options) -> Result<ValueTable> {
+		Self::open_inner(path, id, entry_size, options, true)
+	}
+	fn open_inner(path: &std::path::Path, id: TableId, entry_size: Option<u16>, options: &Options, indexing: bool) -> Result<ValueTable> {
 		let (multipart, entry_size) = match entry_size {
 			Some(s) => (false, s),
 			None => (true, 4096),
@@ -268,7 +278,11 @@ impl ValueTable {
 		assert!(entry_size <= MAX_ENTRY_SIZE as u16);
 		// TODO: posix_fadvise
 		let mut path: std::path::PathBuf = path.into();
-		path.push(id.file_name());
+		path.push(if indexing {
+			id.index_file_name()
+		} else {
+			id.file_name()
+		});
 
 		let mut file = std::fs::OpenOptions::new().create(true).read(true).write(true).open(path.as_path())?;
 		disable_read_ahead(&file)?;
