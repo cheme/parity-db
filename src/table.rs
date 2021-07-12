@@ -60,7 +60,7 @@ use std::mem::MaybeUninit;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use crate::{
-	Key, KEY_LEN,
+	Key,
 	error::Result,
 	column::ColId,
 	log::{LogQuery, LogReader, LogWriter},
@@ -169,6 +169,8 @@ impl Header {
 struct Entry<B: AsRef<[u8]> + AsMut<[u8]>>(usize, B);
 type FullEntry = Entry<[u8; MAX_ENTRY_SIZE]>;
 type PartialEntry = Entry<[u8; 10]>;
+type PartialKeyEntry = Entry<[u8; 40]>;
+
 impl<B: AsRef<[u8]> + AsMut<[u8]>> Entry<B> {
 	#[inline(always)]
 	fn new() -> Self {
@@ -224,6 +226,9 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> Entry<B> {
 		let start = self.0;
 		self.0 += REFS_SIZE;
 		self.1.as_mut()[start..self.0].copy_from_slice(&rc.to_le_bytes());
+	}
+	fn skip_rc(&mut self) {
+		self.0 += REFS_SIZE;
 	}
 	fn write_slice(&mut self, buf: &[u8]) {
 		let start = self.0;
@@ -494,29 +499,33 @@ impl ValueTable {
 			Ok(success)
 		} else {
 			Ok(match self.partial_key_at(index, log)? {
-				Some(existing_key) => &existing_key[6..] == key.table_slice(),
+				Some(existing_key) => &existing_key[..] == key.table_slice(),
 				None => false,
 			})
 		}
 	}
 
-	// TODO consider removing unused 6 first bytes.
-	pub fn partial_key_at<Q: LogQuery>(&self, index: u64, log: &Q) -> Result<Option<[u8; KEY_LEN]>> {
-		let mut buf = [0u8; 40];
-		let mut result = [0u8; KEY_LEN];
-		let buf = if log.value(self.id, index, &mut buf) {
-			&buf
+	pub fn partial_key_at<Q: LogQuery>(&self, index: u64, log: &Q) -> Result<Option<[u8; PARTIAL_SIZE]>> {
+		let mut buf = PartialKeyEntry::new();
+		let mut result = [0u8; PARTIAL_SIZE];
+		let buf = if log.value(self.id, index, &mut buf.1) {
+			&mut buf
 		} else {
-			self.read_at(&mut buf[0..40], index * self.entry_size as u64)?;
-			&buf
+			self.read_at(&mut buf.1[..], index * self.entry_size as u64)?;
+			&mut buf
 		};
-		if &buf[0..SIZE_SIZE] == TOMBSTONE {
+		if buf.is_tombstone() {
 			return Ok(None);
 		}
-		if &buf[0..SIZE_SIZE] == MULTIPART {
-			result[6..].copy_from_slice(&buf[14..40]);
+		if buf.is_multipart() {
+			buf.skip_size();
+			buf.skip_next();
+			buf.skip_rc();
+			result[..].copy_from_slice(buf.read_partial());
 		} else {
-			result[6..].copy_from_slice(&buf[6..32]);
+			buf.skip_size();
+			buf.skip_rc();
+			result[..].copy_from_slice(buf.read_partial());
 		}
 		Ok(Some(result))
 	}
