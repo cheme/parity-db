@@ -199,6 +199,9 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> Entry<B> {
 		self.0 += INDEX_SIZE;
 		u64::from_le_bytes(self.1.as_ref()[start..self.0].try_into().unwrap())
 	}
+	fn skip_next(&mut self) {
+		self.0 += INDEX_SIZE;
+	}
 	fn write_multipart(&mut self) {
 		self.1.as_mut()[0..SIZE_SIZE].copy_from_slice(&MULTIPART);
 		self.0 = SIZE_SIZE;
@@ -211,12 +214,6 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> Entry<B> {
 		let start = self.0;
 		self.0 += INDEX_SIZE;
 		self.1.as_mut()[start..self.0].copy_from_slice(&next_index.to_le_bytes());
-	}
-	fn size(&self) -> u16 {
-		Self::entry_size(self.1.as_ref())
-	}
-	fn entry_size(buf: &[u8]) -> u16 {
-		u16::from_le_bytes(buf[0..SIZE_SIZE].try_into().unwrap())
 	}
 	fn read_rc(&mut self) -> u32 {
 		let start = self.0;
@@ -767,18 +764,19 @@ impl ValueTable {
 			&mut buf
 		};
 
+		let size = buf.read_size();
 		if buf.is_tombstone() {
 			return Ok(false);
 		}
 
-		let (counter_offset, size) = if buf.is_multipart() {
-			(10, self.entry_size as usize)
+		let size = if buf.is_multipart() {
+			buf.skip_next();
+			self.entry_size as usize
 		} else {
-			let size = buf.size();
-			(SIZE_SIZE, size as usize + SIZE_SIZE)
+			buf.offset() + size as usize
 		};
 
-		buf.set_offset(counter_offset);
+		let rc_offset = buf.offset();
 
 		let mut counter = buf.read_rc();
 		debug_assert!(compressed.map(|compressed| if counter & COMPRESSED_MASK > 0 {
@@ -810,7 +808,7 @@ impl ValueTable {
 			counter
 		};
 
-		buf.set_offset(counter_offset);
+		buf.set_offset(rc_offset);
 		buf.write_rc(counter);
 		// TODO: optimize actual buf size
 		log.insert_value(self.id, index, buf.1[0..size].to_vec());
@@ -840,7 +838,7 @@ impl ValueTable {
 				self.write_at(&buf.1[0..entry_size], index * (entry_size as u64))?;
 				log::trace!(target: "parity-db", "{}: Enacted multipart in slot {}", self.id, index);
 		} else {
-			let len = buf.size();
+			let len = buf.read_size();
 			log.read(&mut buf.1[SIZE_SIZE..SIZE_SIZE + len as usize])?;
 			self.write_at(&buf.1[0..(SIZE_SIZE + len as usize)], index * (self.entry_size as u64))?;
 			log::trace!(target: "parity-db", "{}: Enacted {}: {}, {} bytes", self.id, index, hex(&buf.1[6..32]), len);
@@ -867,7 +865,7 @@ impl ValueTable {
 			log::trace!(target: "parity-db", "{}: Validated multipart in slot {}", self.id, index);
 		} else {
 			// TODO: check len
-			let len = buf.size();
+			let len = buf.read_size();
 			log.read(&mut buf.1[SIZE_SIZE..SIZE_SIZE + len as usize])?;
 			log::trace!(target: "parity-db", "{}: Validated {}: {}, {} bytes", self.id, index, hex(&buf.1[SIZE_SIZE..32]), len);
 		}
