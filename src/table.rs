@@ -176,78 +176,81 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> Entry<B> {
 	fn new() -> Self {
 		Entry(0, unsafe { MaybeUninit::uninit().assume_init() })
 	}
+
 	fn set_offset(&mut self, offset: usize) {
 		self.0 = offset;
 	}
+
 	fn offset(&self) -> usize {
 		self.0
 	}
-	fn is_tombstone(&self) -> bool {
-		&self.1.as_ref()[0..SIZE_SIZE] == TOMBSTONE
-	}
-	fn is_multipart(&self) -> bool {
-		&self.1.as_ref()[0..SIZE_SIZE] == MULTIPART
-	}
-	fn read_size(&mut self) -> u16 {
-		let start = self.0;
-		self.0 += SIZE_SIZE;
-		u16::from_le_bytes(self.1.as_ref()[start..self.0].try_into().unwrap())
-	}
-	fn skip_size(&mut self) {
-		self.0 += SIZE_SIZE;
-	}
-	fn read_next(&mut self) -> u64 {
-		let start = self.0;
-		self.0 += INDEX_SIZE;
-		u64::from_le_bytes(self.1.as_ref()[start..self.0].try_into().unwrap())
-	}
-	fn skip_next(&mut self) {
-		self.0 += INDEX_SIZE;
-	}
-	fn write_multipart(&mut self) {
-		self.1.as_mut()[0..SIZE_SIZE].copy_from_slice(&MULTIPART);
-		self.0 = SIZE_SIZE;
-	}
-	fn write_size(&mut self, size: u16) {
-		self.1.as_mut()[0..SIZE_SIZE].copy_from_slice(&size.to_le_bytes());
-		self.0 = SIZE_SIZE;
-	}
-	fn write_next(&mut self, next_index: u64) {
-		let start = self.0;
-		self.0 += INDEX_SIZE;
-		self.1.as_mut()[start..self.0].copy_from_slice(&next_index.to_le_bytes());
-	}
-	fn read_rc(&mut self) -> u32 {
-		let start = self.0;
-		self.0 += REFS_SIZE;
-		u32::from_le_bytes(self.1.as_ref()[start..self.0].try_into().unwrap())
-	}
-	fn write_rc(&mut self, rc: u32) {
-		let start = self.0;
-		self.0 += REFS_SIZE;
-		self.1.as_mut()[start..self.0].copy_from_slice(&rc.to_le_bytes());
-	}
-	fn skip_rc(&mut self) {
-		self.0 += REFS_SIZE;
-	}
+
 	fn write_slice(&mut self, buf: &[u8]) {
 		let start = self.0;
 		self.0 += buf.len();
 		self.1.as_mut()[start..self.0].copy_from_slice(buf);
 	}
+	fn read_slice(&mut self, size: usize) -> &[u8] {
+		let start = self.0;
+		self.0 += size;
+		&self.1.as_ref()[start..self.0]
+	}
+
+	fn is_tombstone(&self) -> bool {
+		&self.1.as_ref()[0..SIZE_SIZE] == TOMBSTONE
+	}
+
+	fn is_multipart(&self) -> bool {
+		&self.1.as_ref()[0..SIZE_SIZE] == MULTIPART
+	}
+	fn write_multipart(&mut self) {
+		self.write_slice(&MULTIPART);
+	}
+
+	fn read_size(&mut self) -> u16 {
+		u16::from_le_bytes(self.read_slice(SIZE_SIZE).try_into().unwrap())
+	}
+	fn skip_size(&mut self) {
+		self.0 += SIZE_SIZE;
+	}
+	fn write_size(&mut self, size: u16) {
+		self.write_slice(&size.to_le_bytes());
+	}
+
+	fn read_next(&mut self) -> u64 {
+		u64::from_le_bytes(self.read_slice(INDEX_SIZE).try_into().unwrap())
+	}
+	fn skip_next(&mut self) {
+		self.0 += INDEX_SIZE;
+	}
+	fn write_next(&mut self, next_index: u64) {
+		self.write_slice(&next_index.to_le_bytes());
+	}
+
+	fn read_rc(&mut self) -> u32 {
+		u32::from_le_bytes(self.read_slice(REFS_SIZE).try_into().unwrap())
+	}
+	fn skip_rc(&mut self) {
+		self.0 += REFS_SIZE;
+	}
+	fn write_rc(&mut self, rc: u32) {
+		self.write_slice(&rc.to_le_bytes());
+	}
+
+	fn read_partial(&mut self) -> &[u8] {
+		self.read_slice(PARTIAL_SIZE)
+	}
+
 	fn read_varint(&mut self) -> u64 {
 		let (stored_len, enc_len) = crate::varint_decode(&self.1.as_ref()[self.0..]);
 		self.0 += enc_len;
 		stored_len
 	}
-	fn read_partial(&mut self) -> &[u8] {
-		let start = self.0;
-		self.0 += PARTIAL_SIZE;
-		&self.1.as_ref()[start..self.0]
-	}
+
 	fn remaining_to(&self, end: usize) -> &[u8] {
 		&self.1.as_ref()[self.0..end]
 	}
+
 	fn read_remaining_to(&mut self, end: usize) -> &[u8] {
 		let start = self.0;
 		self.0 = end;
