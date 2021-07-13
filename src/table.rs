@@ -108,8 +108,8 @@ impl TableId {
 		format!("table_{:02}_{}", self.col(), self.size_tier())
 	}
 
-	pub fn index_file_name(&self) -> String {
-		format!("ordered_index_{:02}_{}", self.col(), self.size_tier())
+	pub fn free_tables_file_name(&self) -> String {
+		format!("free_table_{:02}_{}", self.col(), self.size_tier())
 	}
 
 	pub fn as_u16(&self) -> u16 {
@@ -269,7 +269,7 @@ impl ValueTable {
 	pub fn open_index(path: &std::path::Path, id: TableId, entry_size: Option<u16>, options: &Options) -> Result<ValueTable> {
 		Self::open_inner(path, id, entry_size, options, true)
 	}
-	fn open_inner(path: &std::path::Path, id: TableId, entry_size: Option<u16>, options: &Options, indexing: bool) -> Result<ValueTable> {
+	fn open_inner(path: &std::path::Path, id: TableId, entry_size: Option<u16>, options: &Options, free_tables: bool) -> Result<ValueTable> {
 		let (multipart, entry_size) = match entry_size {
 			Some(s) => (false, s),
 			None => (true, 4096),
@@ -278,8 +278,8 @@ impl ValueTable {
 		assert!(entry_size <= MAX_ENTRY_SIZE as u16);
 		// TODO: posix_fadvise
 		let mut path: std::path::PathBuf = path.into();
-		path.push(if indexing {
-			id.index_file_name()
+		path.push(if free_tables {
+			id.free_tables_file_name()
 		} else {
 			id.file_name()
 		});

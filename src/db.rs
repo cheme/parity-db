@@ -124,13 +124,12 @@ impl DbInner {
 		lock_path.push("lock");
 		let lock_file = std::fs::OpenOptions::new().create(true).read(true).write(true).open(lock_path.as_path())?;
 		lock_file.try_lock_exclusive().map_err(|e| Error::Locked(e))?;
-		let log = Log::open(&options)?;
 
 		let salt = options.load_and_validate_metadata()?;
 		let mut columns = Vec::with_capacity(options.columns.len());
 		let mut commit_overlay = Vec::with_capacity(options.columns.len());
 		for c in 0 .. options.columns.len() {
-			columns.push(Column::open(c as ColId, &options, salt.clone(), &log.overlays)?);
+			columns.push(Column::open(c as ColId, &options, salt.clone())?);
 			commit_overlay.push(
 				HashMap::with_hasher(std::hash::BuildHasherDefault::<IdentityKeyHash>::default())
 			);
@@ -140,7 +139,7 @@ impl DbInner {
 			columns,
 			options: options.clone(),
 			shutdown: std::sync::atomic::AtomicBool::new(false),
-			log,
+			log: Log::open(&options)?,
 			commit_queue: Mutex::new(Default::default()),
 			commit_queue_full_cv: Condvar::new(),
 			log_worker_cv: Condvar::new(),

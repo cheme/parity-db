@@ -58,22 +58,28 @@ pub struct ColumnOptions {
 	pub attach_key: bool,
 	/// Collection do not use index, only table api.
 	pub no_indexing: bool,
-	/// Collection uses a radix tree for indexing, allows
-	/// ordered content.
-	pub ordered_indexed: bool,
+	/// Collection of free ordered by size.
+	pub free_tables: Option<[u16; 15]>,
 }
 
 impl ColumnOptions {
 	fn as_string(&self) -> String {
-		format!("preimage: {}, uniform: {}, refc: {}, compression: {}, with_key: {}, no_index: {}, ordered: {}, insizes: [{}]",
+		format!("preimage: {}, uniform: {}, refc: {}, compression: {}, with_key: {}, no_index: {}, insizes: [{}], free_tables: [{}]",
 			self.preimage,
 			self.uniform,
 			self.ref_counted,
 			self.compression as u8,
 			self.attach_key,
 			self.no_indexing,
-			self.ordered_indexed,
 			self.sizes.iter().fold(String::new(), |mut r, s| {
+				if !r.is_empty() {
+					r.push_str(", ");
+				}
+				r.push_str(&s.to_string());
+				r
+			}),
+			self.free_tables.iter().flat_map(|size| size.iter())
+				.fold(String::new(), |mut r, s| {
 				if !r.is_empty() {
 					r.push_str(", ");
 				}
@@ -109,7 +115,7 @@ impl Default for ColumnOptions {
 			compression_treshold: 4096,
 			attach_key: false,
 			no_indexing: false,
-			ordered_indexed: false,
+			free_tables: None,
 			sizes: [96, 128, 192, 256, 320, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192, 16384, 32768],
 		}
 	}

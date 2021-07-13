@@ -16,7 +16,6 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use parking_lot::RwLock;
 use crate::{
 	Key,
@@ -27,7 +26,7 @@ use crate::{
 	index::{IndexTable, TableId as IndexTableId, PlanOutcome, Address},
 	options::{Options, ColumnOptions},
 	stats::ColumnStats,
-	ordered_index::TestBackend,
+	free_tables::FreeTables,
 };
 use crate::compress::Compress;
 
@@ -50,7 +49,7 @@ struct Reindex {
 pub struct Column {
 	tables: RwLock<Tables>,
 	reindex: RwLock<Reindex>,
-	ordered_index: Option<TestBackend>,
+	free_tables: Option<FreeTables>,
 	path: std::path::PathBuf,
 	preimage: bool,
 	uniform_keys: bool,
@@ -148,11 +147,11 @@ impl Column {
 		self.compression.decompress(buf)
 	}
 
-	pub fn open(col: ColId, options: &Options, salt: Option<Salt>, log: &Arc<RwLock<LogOverlays>>) -> Result<Column> {
+	pub fn open(col: ColId, options: &Options, salt: Option<Salt>) -> Result<Column> {
 		let (index, reindexing, stats) = Self::open_index(&options.path, col)?;
 		let collect_stats = options.stats;
-		let ordered_index = if options.columns[col as usize].ordered_indexed {
-			TestBackend::open(col, &options, log)?
+		let free_tables = if options.columns[col as usize].free_tables.is_some() {
+			FreeTables::open(col, &options)?
 		} else {
 			None
 		};
@@ -193,7 +192,7 @@ impl Column {
 			ref_counted: options.ref_counted,
 			attach_key: options.attach_key,
 			no_indexing: options.no_indexing,
-			ordered_index,
+			free_tables,
 			collect_stats,
 			salt,
 			stats,
