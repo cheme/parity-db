@@ -498,6 +498,12 @@ impl ValueTable {
 		Ok(None)
 	}
 
+	pub fn get_free(&self, index: u64, log: &impl LogQuery) -> Result<Option<(Value, bool)>> {
+		// key unused as free are without indexing.
+		let key = Key::WithKey(index, Default::default());
+		self.get(&key, index, log)
+	}
+
 	pub fn size(&self, key: &Key, index: u64, log: &impl LogQuery) -> Result<Option<(u32, bool)>> {
 		let mut result = 0;
 		let (success, compressed) = self.for_parts(key, index, log, |buf| {

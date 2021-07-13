@@ -55,7 +55,7 @@ impl FreeTables {
 		};
 
 		// TODO check free_tables_index option, return None otherwhise.
-		let mut result = FreeTables {
+		Ok(Some(FreeTables {
 			tables: [
 				Self::open_table(path, col, 0, &options)?,
 				Self::open_table(path, col, 1, &options)?,
@@ -74,9 +74,7 @@ impl FreeTables {
 				Self::open_table(path, col, 14, &options)?,
 				Self::open_table(path, col, 15, &options)?,
 			]
-		};
-
-		Ok(Some(result))
+		}))
 	}
 
 	fn open_table(
@@ -101,18 +99,18 @@ impl FreeTables {
 
 		unimplemented!()
 	}
-	fn get(&self, index: u64, log: &RwLock<LogOverlays>) -> Option<Vec<u8>> {
+	pub(crate) fn get(&self, index: u64, log: &RwLock<LogOverlays>) -> Result<Option<Vec<u8>>> {
 		let address = Address::from_u64(index);
 		let size_tier = address.size_tier() as usize;
 		let offset = address.offset();
-		match self.tables[size_tier].get(&Key::FreeIndex(address), offset, log) {
-			Ok(Some((value, false))) => {
+		Ok(match self.tables[size_tier].get_free(offset, log)? {
+			Some((value, false)) => {
 				Some(value)
 			},
 			_ => {
-				None // TODO correct error handling
+				None
 			},
-		}
+		})
 	}
 	fn update(&mut self, at: u64, content: Vec<u8>) -> Option<u64> {
 		unimplemented!()

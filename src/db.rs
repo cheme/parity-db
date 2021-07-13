@@ -92,6 +92,11 @@ impl std::hash::Hasher for IdentityKeyHash {
 	}
 }
 
+struct CommitOverlay {
+	overlay: HashMap<Key, (u64, Option<Value>), IdentityBuildHasher>,
+	free_table_overlay: HashMap<u64, (u64, Option<Value>), IdentityBuildHasher>,
+}
+
 struct DbInner {
 	columns: Vec<Column>,
 	options: Options,
@@ -104,7 +109,7 @@ struct DbInner {
 	commit_worker_cv: Condvar,
 	commit_work: Mutex<bool>,
 	// Overlay of most recent values int the commit queue. ColumnId -> (Key -> (RecordId, Value)).
-	commit_overlay: RwLock<Vec<HashMap<Key, (u64, Option<Value>), IdentityBuildHasher>>>,
+	commit_overlay: RwLock<Vec<CommitOverlay>>,
 	log_cv: Condvar,
 	log_queue_bytes: Mutex<u64>,
 	flush_worker_cv: Condvar,
@@ -130,9 +135,10 @@ impl DbInner {
 		let mut commit_overlay = Vec::with_capacity(options.columns.len());
 		for c in 0 .. options.columns.len() {
 			columns.push(Column::open(c as ColId, &options, salt.clone())?);
-			commit_overlay.push(
-				HashMap::with_hasher(std::hash::BuildHasherDefault::<IdentityKeyHash>::default())
-			);
+			commit_overlay.push(CommitOverlay {
+				overlay: HashMap::with_hasher(std::hash::BuildHasherDefault::<IdentityKeyHash>::default()),
+				free_table_overlay: HashMap::with_hasher(std::hash::BuildHasherDefault::<IdentityKeyHash>::default()),
+			});
 		}
 		log::debug!(target: "parity-db", "Opened db {:?}, salt={:?}", options, salt);
 		Ok(DbInner {
@@ -182,7 +188,9 @@ impl DbInner {
 		let key = self.columns[col as usize].hash(key);
 		let overlay = self.commit_overlay.read();
 		// Check commit overlay first
-		if let Some(v) = overlay.get(col as usize).and_then(|o| o.get(&key).map(|(_, v)| v.clone())) {
+		if let Some(v) = overlay.get(col as usize)
+			.and_then(|o| o.overlay.get(&key)
+			.map(|(_, v)| v.clone())) {
 			return Ok(v);
 		}
 		// Go into tables and log overlay.
@@ -190,12 +198,25 @@ impl DbInner {
 		self.columns[col as usize].get(&key, log)
 	}
 
+	fn get_free_table(&self, col: ColId, at: u64) -> Result<Option<Value>> {
+		let overlay = self.commit_overlay.read();
+		// Check commit overlay first
+		if let Some(v) = overlay.get(col as usize)
+			.and_then(|o| o.free_table_overlay.get(&at)
+			.map(|(_, v)| v.clone())) {
+			return Ok(v);
+		}
+		// Go into tables and log overlay.
+		let log = self.log.overlays();
+		self.columns[col as usize].get_free_table(at, log)
+	}
+
 	fn get_size(&self, col: ColId, key: &[u8]) -> Result<Option<u32>> {
 		let key = self.columns[col as usize].hash(key);
 		let overlay = self.commit_overlay.read();
 		// Check commit overlay first
 		if let Some(l) = overlay.get(col as usize).and_then(
-			|o| o.get(&key).map(|(_, v)| v.as_ref().map(|v| v.len() as u32))
+			|o| o.overlay.get(&key).map(|(_, v)| v.as_ref().map(|v| v.len() as u32))
 		) {
 			return Ok(l);
 		}
@@ -204,7 +225,7 @@ impl DbInner {
 		self.columns[col as usize].get_size(&key, log)
 	}
 
-	// Commit is simply adds the the data to the queue and to the overlay and
+	// Commit simply adds the the data to the queue and to the overlay and
 	// exits as early as possible.
 	fn commit<I, K>(&self, tx: I) -> Result<()>
 		where
@@ -239,7 +260,7 @@ impl DbInner {
 				bytes += v.as_ref().map_or(0, |v|v.len());
 				// Don't add removed ref-counted values to overlay.
 				if !self.options.columns[*c as usize].ref_counted || v.is_some() {
-					overlay[*c as usize].insert(k.clone(), (record_id, v.clone()));
+					overlay[*c as usize].overlay.insert(k.clone(), (record_id, v.clone()));
 				}
 			}
 
@@ -336,7 +357,7 @@ impl DbInner {
 				let mut overlay = self.commit_overlay.write();
 				for (c, key, _) in commit.changeset.iter() {
 					let overlay = &mut overlay[*c as usize];
-					if let std::collections::hash_map::Entry::Occupied(e) = overlay.entry(key.clone()) {
+					if let std::collections::hash_map::Entry::Occupied(e) = overlay.overlay.entry(key.clone()) {
 						if e.get().0 == commit.id {
 							e.remove_entry();
 						}
@@ -664,6 +685,10 @@ impl Db {
 
 	pub fn get(&self, col: ColId, key: &[u8]) -> Result<Option<Value>> {
 		self.inner.get(col, key)
+	}
+
+	pub fn get_free_table(&self, col: ColId, at: u64) -> Result<Option<Value>> {
+		self.inner.get_free_table(col, at)
 	}
 
 	pub fn get_size(&self, col: ColId, key: &[u8]) -> Result<Option<u32>> {

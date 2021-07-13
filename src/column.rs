@@ -49,7 +49,7 @@ struct Reindex {
 pub struct Column {
 	tables: RwLock<Tables>,
 	reindex: RwLock<Reindex>,
-	free_tables: Option<FreeTables>,
+	free_tables: Option<RwLock<FreeTables>>,
 	path: std::path::PathBuf,
 	preimage: bool,
 	uniform_keys: bool,
@@ -83,6 +83,15 @@ impl Column {
 			self.stats.query_miss();
 		}
 		Ok(None)
+	}
+
+	pub fn get_free_table(&self, index: u64, log: &RwLock<LogOverlays>) -> Result<Option<Value>> {
+		if let Some(free_tables) = self.free_tables.as_ref() {
+			let tables = free_tables.read();
+			tables.get(index, log)
+		} else {
+			panic!("TODO correct error");
+		}
 	}
 
 	pub fn get_size(&self, key: &Key, log: &RwLock<LogOverlays>) -> Result<Option<u32>> {
@@ -151,7 +160,7 @@ impl Column {
 		let (index, reindexing, stats) = Self::open_index(&options.path, col)?;
 		let collect_stats = options.stats;
 		let free_tables = if options.columns[col as usize].free_tables.is_some() {
-			FreeTables::open(col, &options)?
+			FreeTables::open(col, &options)?.map(|tables| RwLock::new(tables))
 		} else {
 			None
 		};
