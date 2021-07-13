@@ -69,11 +69,8 @@ impl Column {
 			let offset = address.offset();
 			return Ok(match tables.value[size_tier].get(key, offset, log)? {
 				Some((value, compressed)) => {
-					let value = if compressed {
-						self.decompress(&value)
-					} else {
-						value
-					};
+					// option do not allow compress and no_indexing
+					debug_assert!(!compressed);
 					Some(value)
 				},
 				_ => {
@@ -342,7 +339,13 @@ impl Column {
 		//TODO: return sub-chunk position in index.get
 		let tables = self.tables.upgradable_read();
 		let reindex = self.reindex.upgradable_read();
-		let existing = Self::search_all_indexes(key, &*tables, &*reindex, log)?;
+		let existing = if self.no_indexing {
+			let address = Address::from_u64(key.index());
+			let tier = address.size_tier();
+			Some((&tables.index, 0, tier, address))
+		} else {
+			Self::search_all_indexes(key, &*tables, &*reindex, log)?
+		};
 		if let &Some(ref val) = value {
 			let (cval, target_tier) = self.compress(&key, &val, &*tables);
 			let (cval, compressed) = cval.as_ref()

@@ -670,6 +670,10 @@ impl Db {
 		self.inner.get_size(col, key)
 	}
 
+	pub fn no_indexing_new_index(&self, col: ColId, prev_free: u64) -> Result<u64> {
+		unimplemented!("fetch next free index of table");
+	}
+
 	pub fn commit<I, K>(&self, tx: I) -> Result<()>
 	where
 		I: IntoIterator<Item=(ColId, K, Option<Value>)>,

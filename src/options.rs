@@ -92,6 +92,12 @@ impl ColumnOptions {
 			return false;
 		}*/
 
+		if self.no_indexing && self.compression != crate::compress::CompressionType::NoCompression {
+			// Cannot create table index before compressing.
+			// To use compression, just compress value externally.
+			return false;
+		}
+
 		true
 	}
 }
