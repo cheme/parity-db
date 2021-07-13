@@ -26,7 +26,6 @@ use crate::{
 	index::{IndexTable, TableId as IndexTableId, PlanOutcome, Address},
 	options::{Options, ColumnOptions},
 	stats::ColumnStats,
-	free_tables::FreeTables,
 };
 use crate::compress::Compress;
 
@@ -49,7 +48,6 @@ struct Reindex {
 pub struct Column {
 	tables: RwLock<Tables>,
 	reindex: RwLock<Reindex>,
-	free_tables: Option<RwLock<FreeTables>>,
 	path: std::path::PathBuf,
 	preimage: bool,
 	uniform_keys: bool,
@@ -65,6 +63,24 @@ pub struct Column {
 impl Column {
 	pub fn get(&self, key: &Key, log: &RwLock<LogOverlays>) -> Result<Option<Value>> {
 		let tables = self.tables.read();
+		if self.no_indexing {
+			let address = Address::from_u64(key.index());
+			let size_tier = address.size_tier() as usize;
+			let offset = address.offset();
+			return Ok(match tables.value[size_tier].get(key, offset, log)? {
+				Some((value, compressed)) => {
+					let value = if compressed {
+						self.decompress(&value)
+					} else {
+						value
+					};
+					Some(value)
+				},
+				_ => {
+					None
+				},
+			})
+		}
 		if let Some((tier, value)) = self.get_in_index(key, &tables.index, &*tables, log)? {
 			if self.collect_stats {
 				self.stats.query_hit(tier);
@@ -83,15 +99,6 @@ impl Column {
 			self.stats.query_miss();
 		}
 		Ok(None)
-	}
-
-	pub fn get_free_table(&self, index: u64, log: &RwLock<LogOverlays>) -> Result<Option<Value>> {
-		if let Some(free_tables) = self.free_tables.as_ref() {
-			let tables = free_tables.read();
-			tables.get(index, log)
-		} else {
-			panic!("TODO correct error");
-		}
 	}
 
 	pub fn get_size(&self, key: &Key, log: &RwLock<LogOverlays>) -> Result<Option<u32>> {
@@ -159,11 +166,6 @@ impl Column {
 	pub fn open(col: ColId, options: &Options, salt: Option<Salt>) -> Result<Column> {
 		let (index, reindexing, stats) = Self::open_index(&options.path, col)?;
 		let collect_stats = options.stats;
-		let free_tables = if options.columns[col as usize].free_tables.is_some() {
-			FreeTables::open(col, &options)?.map(|tables| RwLock::new(tables))
-		} else {
-			None
-		};
 
 		let path = &options.path;
 		let options = &options.columns[col as usize];
@@ -201,7 +203,6 @@ impl Column {
 			ref_counted: options.ref_counted,
 			attach_key: options.attach_key,
 			no_indexing: options.no_indexing,
-			free_tables,
 			collect_stats,
 			salt,
 			stats,
@@ -211,7 +212,7 @@ impl Column {
 
 	pub fn hash(&self, key: &[u8]) -> Key {
 		assert!(!self.no_indexing);
-		hash_utils(key, self.attach_key, self.uniform_keys, &self.salt)
+		hash_utils(key, self.attach_key, self.uniform_keys, self.no_indexing, &self.salt)
 	}
 
 	pub fn flush(&self) -> Result<()> {
@@ -594,11 +595,16 @@ impl Column {
 	}
 }
 
-pub(crate) fn hash_utils(key: &[u8], attach_key: bool, uniform_keys: bool, salt: &Option<Salt>) -> Key {
-	if attach_key {
+pub(crate) fn hash_utils(key: &[u8], attach_key: bool, uniform_keys: bool, no_indexing: bool, salt: &Option<Salt>) -> Key {
+	if no_indexing {
 		let mut k = [0u8; 8];
-		if uniform_keys {
-			k.copy_from_slice(&key[0..32]);
+		k.copy_from_slice(&key[0..8]);
+		use std::convert::TryInto;
+		Key::WithKey(u64::from_be_bytes((k).try_into().unwrap()), Default::default())
+	} else if attach_key  {
+		let mut k = [0u8; 8];
+		if uniform_keys || no_indexing {
+			k.copy_from_slice(&key[0..8]);
 		} else if let Some(salt) = &salt {
 			k.copy_from_slice(blake2_rfc::blake2b::blake2b(8, &salt[..], &key).as_bytes());
 		} else {

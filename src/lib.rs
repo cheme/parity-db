@@ -17,7 +17,6 @@
 mod db;
 mod error;
 mod index;
-mod free_tables;
 mod table;
 mod column;
 mod log;

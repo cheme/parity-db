@@ -108,10 +108,6 @@ impl TableId {
 		format!("table_{:02}_{}", self.col(), self.size_tier())
 	}
 
-	pub fn free_tables_file_name(&self) -> String {
-		format!("free_table_{:02}_{}", self.col(), self.size_tier())
-	}
-
 	pub fn as_u16(&self) -> u16 {
 		self.0
 	}
@@ -264,12 +260,6 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> Entry<B> {
 
 impl ValueTable {
 	pub fn open(path: &std::path::Path, id: TableId, entry_size: Option<u16>, options: &Options) -> Result<ValueTable> {
-		Self::open_inner(path, id, entry_size, options, false)
-	}
-	pub fn open_index(path: &std::path::Path, id: TableId, entry_size: Option<u16>, options: &Options) -> Result<ValueTable> {
-		Self::open_inner(path, id, entry_size, options, true)
-	}
-	fn open_inner(path: &std::path::Path, id: TableId, entry_size: Option<u16>, options: &Options, free_tables: bool) -> Result<ValueTable> {
 		let (multipart, entry_size) = match entry_size {
 			Some(s) => (false, s),
 			None => (true, 4096),
@@ -278,11 +268,7 @@ impl ValueTable {
 		assert!(entry_size <= MAX_ENTRY_SIZE as u16);
 		// TODO: posix_fadvise
 		let mut path: std::path::PathBuf = path.into();
-		path.push(if free_tables {
-			id.free_tables_file_name()
-		} else {
-			id.file_name()
-		});
+		path.push(id.file_name());
 
 		let mut file = std::fs::OpenOptions::new().create(true).read(true).write(true).open(path.as_path())?;
 		disable_read_ahead(&file)?;
@@ -496,12 +482,6 @@ impl ValueTable {
 			return Ok(Some((result, compressed)));
 		}
 		Ok(None)
-	}
-
-	pub fn get_free(&self, index: u64, log: &impl LogQuery) -> Result<Option<(Value, bool)>> {
-		// key unused as free are without indexing.
-		let key = Key::WithKey(index, Default::default());
-		self.get(&key, index, log)
 	}
 
 	pub fn size(&self, key: &Key, index: u64, log: &impl LogQuery) -> Result<Option<(u32, bool)>> {
@@ -1008,7 +988,11 @@ mod test {
 	}
 
 	fn key(k: u32, options: &ColumnOptions) -> Key {
-		crate::column::hash_utils(&k.to_le_bytes()[..], options.attach_key, false, &None)
+		if options.no_indexing {
+			crate::column::hash_utils(&(k as u64).to_be_bytes()[..], options.attach_key, false, true, &None)
+		} else {
+			crate::column::hash_utils(&k.to_le_bytes()[..], options.attach_key, false, false, &None)
+		}
 	}
 
 	fn value(size: usize) -> Value {
@@ -1213,9 +1197,9 @@ mod test {
 		let log = dir.log();
 
 		let key1 = value(20000);
-		let key1 = crate::column::hash_utils(&key1[..], options.attach_key, false, &None);
+		let key1 = crate::column::hash_utils(&key1[..], options.attach_key, false, false, &None);
 		let key2 = value(16000);
-		let key2 = crate::column::hash_utils(&key2[..], options.attach_key, false, &None);
+		let key2 = crate::column::hash_utils(&key2[..], options.attach_key, false, false, &None);
 		let val1 = value(30);
 		let val2 = value(5000);
 		let compressed = false;
