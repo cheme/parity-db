@@ -51,6 +51,7 @@ impl FreeTables {
 			attach_key: false,
 			free_tables: options.columns[col as usize].free_tables.clone(),
 			no_indexing: true,
+			// TODO no_rc and no_compress (but should be generic to all tables).
 		};
 
 		// TODO check free_tables_index option, return None otherwhise.
@@ -104,7 +105,7 @@ impl FreeTables {
 		let address = Address::from_u64(index);
 		let size_tier = address.size_tier() as usize;
 		let offset = address.offset();
-		match self.tables[size_tier].get(&Key::free_index(address), offset, log) {
+		match self.tables[size_tier].get(&Key::FreeIndex(address), offset, log) {
 			Ok(Some((value, false))) => {
 				Some(value)
 			},

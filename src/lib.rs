@@ -39,6 +39,8 @@ pub enum Key { // TODO remove pub??
 	// TODO if withkeyref, try bench against &[u8; KEYLEN] (HashRef)
 	// but issue with [] passing is probably fixed.
 	WithKey(u64, Vec<u8>),
+	// free tables index.
+	FreeIndex(crate::index::Address),
 	// TODO consider withkeyref(u64, &'a[u8])
 }
 
@@ -48,6 +50,7 @@ impl std::hash::Hash for Key {
 			Key::Hash(hash) => state.write(&hash[..]),
 			// warn don't use for persistence (ne_bytes)
 			Key::WithKey(hash, _full) => state.write(&hash.to_ne_bytes()[..]),
+			Key::FreeIndex(address) => state.write(&address.as_u64().to_ne_bytes()[..]),
 		}
 	}
 }
@@ -57,6 +60,7 @@ impl AsRef<[u8]> for Key {
 		match self {
 			Key::Hash(hash) => &hash[..],
 			Key::WithKey(_hash, full) => &full[..],
+			Key::FreeIndex(_) => unreachable!("No byte key for free index"),
 		}
 	}
 }
@@ -67,6 +71,7 @@ impl Key {
 		match self {
 			Key::Hash(hash) => hash.len(),
 			Key::WithKey(_hash, full) => full.len(),
+			Key::FreeIndex(_) => unreachable!("No byte key for free index"),
 		}
 	}
 
@@ -77,6 +82,7 @@ impl Key {
 			Key::WithKey(_hash, full) => {
 				varint_encoded_len(full.len() as u64) + full.len()
 			},
+			Key::FreeIndex(_) => unreachable!("No byte key for free index"),
 		}
 	}
 
@@ -84,6 +90,7 @@ impl Key {
 		match self {
 			Key::Hash(hash) => &hash[6..],
 			Key::WithKey(_hash, full) => &full[..],
+			Key::FreeIndex(_) => unreachable!("No byte key for free index"),
 		}
 	}
 
@@ -94,6 +101,7 @@ impl Key {
 				u64::from_be_bytes((hash[0..8]).try_into().unwrap())
 			},
 			Key::WithKey(hash, _full) => *hash,
+			Key::FreeIndex(address) => address.as_u64(),
 		}
 	}
 
