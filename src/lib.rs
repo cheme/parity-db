@@ -24,6 +24,7 @@ mod display;
 mod options;
 mod stats;
 mod compress;
+mod no_indexing;
 
 pub use db::Db;
 pub use error::{Error, Result};
