@@ -53,7 +53,6 @@ const MIN_LOG_SIZE: u64 = 16 * 1024 * 1024;
 /// Value is just a vector of bytes. Value sizes up to 4Gb are allowed.
 pub type Value = Vec<u8>;
 
-
 // Commit data passed to `commit`
 #[derive(Default)]
 struct Commit {
@@ -626,6 +625,12 @@ pub struct Db {
 	commit_thread: Option<std::thread::JoinHandle<()>>,
 	flush_thread: Option<std::thread::JoinHandle<()>>,
 	log_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+// reference to db for free table handle operation.
+#[derive(Clone)]
+pub(crate) struct DbHandle {
+	inner: Arc<DbInner>,
 }
 
 impl Db {
