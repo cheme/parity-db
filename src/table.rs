@@ -546,6 +546,14 @@ impl ValueTable {
 		return Ok(next);
 	}
 
+	pub fn read_next_free_no_log(&self, index: u64) -> Result<u64> {
+		let mut buf = PartialEntry::new();
+		self.read_at(&mut buf.1, index * self.entry_size as u64)?;
+		buf.skip_size();
+		let next = buf.read_next();
+		return Ok(next);
+	}
+
 	pub fn read_next_part(&self, index: u64, log: &LogWriter) -> Result<Option<u64>> {
 		let mut buf = PartialEntry::new();
 		if log.value(self.id, index, &mut buf.1) {
@@ -915,6 +923,13 @@ impl ValueTable {
 			self.file.sync_data()?;
 		}
 		Ok(())
+	}
+
+	pub fn current_free_table_state(&self) -> (u64, u64) {
+		(
+			self.filled.load(std::sync::atomic::Ordering::Relaxed),
+			self.last_removed.load(std::sync::atomic::Ordering::Relaxed),
+		)
 	}
 }
 

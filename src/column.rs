@@ -596,6 +596,17 @@ impl Column {
 		log::debug!(target: "parity-db", "Dropped {}", id);
 		Ok(())
 	}
+
+	pub fn current_free_table_state(&self, table_ix: u8) -> (u64, u64) {
+		// TODO when changes in log: this will not work, we want value after log flushed
+		// TODO switch init after log replay!!
+		self.tables.read().value[table_ix as usize].current_free_table_state()
+	}
+
+	pub fn read_next_free(&self, table_ix: u8, free: u64, log: &RwLock<LogOverlays>) -> u64 {
+		// We read directly in table since any change in log is also contain in the manager.
+		self.tables.read().value[table_ix as usize].read_next_free_no_log(free).unwrap_or(0)
+	}
 }
 
 pub(crate) fn hash_utils(key: &[u8], attach_key: bool, uniform_keys: bool, no_indexing: bool, salt: &Option<Salt>) -> Key {

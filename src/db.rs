@@ -113,6 +113,7 @@ struct DbInner {
 	next_reindex: AtomicU64,
 	collect_stats: bool,
 	bg_err: Mutex<Option<Arc<Error>>>,
+	free_table_id_manager: RwLock<crate::no_indexing::IdManager>, // TODO mutex instead?
 	_lock_file: std::fs::File,
 }
 
@@ -155,6 +156,7 @@ impl DbInner {
 			last_enacted: AtomicU64::new(1),
 			collect_stats: options.stats,
 			bg_err: Mutex::new(None),
+			free_table_id_manager: RwLock::new(crate::no_indexing::IdManager::new(&options)),
 			_lock_file: lock_file,
 		})
 	}
@@ -627,12 +629,6 @@ pub struct Db {
 	log_thread: Option<std::thread::JoinHandle<()>>,
 }
 
-// reference to db for free table handle operation.
-#[derive(Clone)]
-pub(crate) struct DbHandle {
-	inner: Arc<DbInner>,
-}
-
 impl Db {
 	pub fn with_columns(path: &std::path::Path, num_columns: u8) -> Result<Db> {
 		let options = Options::with_columns(path, num_columns);
@@ -647,6 +643,8 @@ impl Db {
 		// This needs to be call before log thread: so first reindexing
 		// will run in correct state.
 		db.replay_all_logs()?;
+		let db_handle = DbHandle { inner: db.clone() };
+		db.free_table_id_manager.write().init(db_handle);
 		let commit_worker_db = db.clone();
 		let commit_thread = std::thread::spawn(move ||
 			commit_worker_db.store_err(Self::commit_worker(commit_worker_db.clone()))
@@ -755,5 +753,25 @@ impl Drop for Db {
 		if let Err(e) = self.inner.kill_logs() {
 			log::warn!(target: "parity-db", "Shutdown error: {:?}", e);
 		}
+	}
+}
+
+// reference to db for free table handle operation.
+#[derive(Clone)]
+pub(crate) struct DbHandle {
+	inner: Arc<DbInner>,
+}
+
+impl DbHandle {
+	pub(crate) fn current_free_table_state(&self, col_id: ColId, table_ix: u8) -> (u64, u64) {
+		self.inner.columns[col_id as usize].current_free_table_state(table_ix)
+	}
+
+	pub(crate) fn read_next_free(&self, col_id: ColId, table_ix: u8, free: u64) -> u64 {
+		self.inner.columns[col_id as usize].read_next_free(table_ix, free, &*self.inner.log.overlays)
+	}
+
+	pub(crate) fn fetch_free_id(&self, handle_id: crate::no_indexing::HandleId, col: ColId, size_tier: u8) -> u64 {
+		self.inner.free_table_id_manager.write().fetch_free_id(handle_id, col, size_tier)
 	}
 }

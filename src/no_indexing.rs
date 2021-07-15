@@ -35,26 +35,26 @@
 
 use crate::column::ColId;
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use crate::db::DbHandle;
 use parking_lot::{Condvar, Mutex};
 
-type HandleId = u64;
+pub(crate) type HandleId = u64;
 
 /// Handle to the index management for querying new ids.
 /// On drop it releases fetched ids.
 ///
 /// WARNING this struct locks db on drop and shall allways
 /// live longer than the db.
-struct FreeIdHandle {
-	locked: Mutex<Lock>,
-	locked_cv: Condvar,
+pub struct FreeIdHandle {
+	locked: Arc<(Mutex<Lock>, Condvar)>,
 	id: HandleId,
-	col: ColId,
-	read_only: bool,
+	col: ColId, // TODO useless since handle is for a collection?
+	read_only: Option<Vec<Option<u64>>>, // contain filled u64 when read_only
 	locked_write: bool,
 	locked_read: bool,
-	need_release: bool,
+	no_need_release: bool,
 	is_ready: bool,
 	db: DbHandle,
 }
@@ -72,28 +72,38 @@ impl FreeIdHandle {
 		self.is_ready = true;
 		if self.locked_read {
 			loop {
-				let mut lock = self.locked.lock();
+				let mut lock = self.locked.0.lock();
 				if lock.lock_read(self.id) {
 					return;
 				}
-				self.locked_cv.wait(&mut lock);
+				self.locked.1.wait(&mut lock);
 			}
 		} else if self.locked_write {
 			loop {
 				let mut first = true;
-				let mut lock = self.locked.lock();
+				let mut lock = self.locked.0.lock();
 				if lock.lock_write(self.id, first) {
 					return;
 				}
 				first = false;
-				self.locked_cv.wait(&mut lock);
+				self.locked.1.wait(&mut lock);
 			}
 		}
 		unimplemented!();
 	}
 	/// Get a new id. This synchs with the id manager.
 	fn fetch_free_id(&mut self, size_tier: u8) -> u64 {
-		unimplemented!()
+		if let Some(filled) = self.read_only.as_mut() {
+			let filled = &mut filled[size_tier as usize];
+			if filled.is_none() {
+				let (current_filled, _next_free) = self.db.current_free_table_state(self.col, size_tier);
+				*filled = Some(current_filled)
+			}
+			let filled = filled.as_mut().unwrap();
+			*filled += 1;
+			return *filled - 1;
+		}
+		self.db.fetch_free_id(self.id, self.col, size_tier)
 	}
 
 	/// Collection for this handle.
@@ -105,8 +115,8 @@ impl FreeIdHandle {
 	/// This need to switch off `drop_handle_inner` when handle
 	/// is dropped.
 	fn commit(mut self) {
-		self.need_release = false;
-		if self.read_only {
+		self.no_need_release = true;
+		if self.read_only.is_some() {
 			return;
 		}
 		unimplemented!()
@@ -115,7 +125,7 @@ impl FreeIdHandle {
 	/// Release fetched ids, put the handle in a consumed state.
 	/// Should never panic (called by drop).
 	fn drop_handle_inner(&mut self) {
-		if !self.need_release {
+		if self.no_need_release {
 			return;
 		}
 		unimplemented!()
@@ -131,22 +141,25 @@ impl Drop for FreeIdHandle {
 	}
 }
 
-struct IdManager {
+pub(crate) struct IdManager {
 	columns: Vec<Option<ColIdManager>>,
-	db: DbHandle,
+	db: Option<DbHandle>,
 }
 
 impl IdManager {
-	fn new(db: DbHandle, options: &crate::options::Options) -> Self {
-		let mut columns = Vec::with_capacity(options.columns.len());
-		for c in options.columns.iter() {
-			if c.no_indexing {
-				columns.push(Some(ColIdManager::default()));
-			} else {
-				columns.push(None);
+	pub(crate) fn new(options: &crate::options::Options) -> Self {
+		let columns = options.columns.iter()
+			.map(|c| c.no_indexing.then(|| ColIdManager::default()))
+			.collect();
+		IdManager { db: None, columns }
+	}
+	pub(crate) fn init(&mut self, db: DbHandle) {
+		self.db = Some(db);
+		for c in self.columns.iter_mut() {
+			if let Some(col_manager) = c.as_mut() {
+				col_manager.init_state(self.db.as_ref().unwrap());
 			}
 		}
-		IdManager { db, columns }
 	}
 }
 
@@ -201,17 +214,39 @@ impl Lock {
 /// Id management view.
 #[derive(Default)]
 struct ColIdManager {
-	locked: Mutex<Lock>,
-	locked_cv: Condvar,
+	col_id: ColId,
+	locked: Arc<(Mutex<Lock>, Condvar)>,
 	current_handles: BTreeMap<HandleId, FetchedIds>,
 	free_handles: Vec<HandleId>,
+	tables: Vec<TableIdManager>,
+}
+
+#[derive(Default)]
+struct TableIdManager {
+	filled: u64,
+	next_free: usize,
+	// TODO could be last_filled
+	pending_filled: usize,
+	pending_next_free: usize,
+	// head is first
+	free_list: VecDeque<(u64, HandleId)>,
+	// TODO first tuple item could be len + offset.
+	filled_list: VecDeque<(u64, HandleId)>,
 }
 
 impl ColIdManager {
+	fn init_state(&mut self, db: &DbHandle) {
+		for table_ix in 0..crate::table::SIZE_TIERS {
+			let mut table_manager = TableIdManager::default();
+			let (filled, next_free) = db.current_free_table_state(self.col_id, table_ix as u8);
+			table_manager.free_list.push_back((next_free, 0));
+			table_manager.filled_list.push_back((filled, 0));
+		}
+	}
 	fn release(&mut self, handle_id: HandleId) {
-		let mut lock = self.locked.lock();
+		let mut lock = self.locked.0.lock();
 		if lock.release(handle_id) {
-			self.locked_cv.notify_all();
+			self.locked.1.notify_all();
 		}
 	}
 	fn next_handle_id(&mut self, single_write: bool, read_lock: bool) -> HandleId {
@@ -233,30 +268,84 @@ impl ColIdManager {
 	}
 }
 
+impl TableIdManager {
+	fn fetch_free_id(&mut self, handle_id: crate::no_indexing::HandleId, db: &DbHandle, col_id: ColId, table_ix: u8) -> u64 {
+		if self.free_list[self.pending_next_free].0 != 0 {
+			// read from removed list
+			if self.pending_next_free == self.free_list.len() {
+				let next = db.read_next_free(col_id, table_ix, self.free_list[self.pending_next_free].0);
+				self.free_list.push_back((next, 0));
+			}
+			self.pending_next_free += 1;
+			self.free_list[self.pending_next_free - 1].1 = handle_id;
+			self.free_list[self.pending_next_free - 1].0
+		} else {
+			// extend table
+			self.filled_list[self.pending_filled].1 = handle_id;
+			let result = self.filled_list[self.pending_filled].0;
+			self.filled_list.push_back((result + 1, 0));
+			self.pending_filled += 1;
+			result
+		}
+	}
+}
+
 type FetchedIds = Vec<u64>;
 
 impl IdManager {
 	// `single_write` to true does opt-in for locking. One must call `ready` afterward.
-	pub fn get_handle(&mut self, col: ColId, single_write: bool) -> Option<FreeIdHandle> {
-		if let Some(col) = self.columns[col as usize].as_mut() {
+	pub fn get_handle(&mut self, col_id: ColId, single_write: bool) -> Option<FreeIdHandle> {
+		if let Some(col) = self.columns[col_id as usize].as_mut() {
 			let handle_id = col.next_handle_id(single_write, false);
-			unimplemented!()
+			Some(FreeIdHandle {
+				locked: col.locked.clone(),
+				id: handle_id,
+				col: col_id,
+				read_only: None,
+				locked_write: single_write,
+				locked_read: false,
+				no_need_release: false,
+				is_ready: false,
+				db: self.db.as_ref().unwrap().clone(),
+			})
 		} else {
 			None
 		}
 	}
 
 	// `no_write` to true does opt-in for locking. One must call `ready` afterward.
-	pub fn get_read_only_handle(&mut self, col: ColId, no_write: bool) -> Option<FreeIdHandle> {
-		if let Some(col) = self.columns[col as usize].as_mut() {
+	pub fn get_read_only_handle(&mut self, col_id: ColId, no_write: bool) -> Option<FreeIdHandle> {
+		if let Some(col) = self.columns[col_id as usize].as_mut() {
 			let handle_id = if !no_write {
 				0 // unmanaged.
 			} else {
 				col.next_handle_id(false, true)
 			};
-			unimplemented!()
+			Some(FreeIdHandle {
+				locked: col.locked.clone(),
+				id: handle_id,
+				col: col_id,
+				read_only: Some(vec![None; crate::table::SIZE_TIERS]),
+				locked_write: false,
+				locked_read: no_write,
+				no_need_release: false,
+				is_ready: !no_write,
+				db: self.db.as_ref().unwrap().clone(),
+			})
 		} else {
 			None
+		}
+	}
+
+	pub(crate) fn fetch_free_id(&mut self, handle_id: crate::no_indexing::HandleId, col: ColId, size_tier: u8) -> u64 {
+		if let Some(Some(column)) = self.columns.get_mut(col as usize) {
+			if let Some(table) = column.tables.get_mut(size_tier as usize) {
+				table.fetch_free_id(handle_id, &self.db.as_ref().unwrap(), col, size_tier)
+			} else {
+				0
+			}
+		} else {
+			0
 		}
 	}
 }
