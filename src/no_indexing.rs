@@ -179,7 +179,7 @@ impl FreeIdHandle {
 		I: Iterator<Item=&'a (ColId, K, Option<Value>)>,
 		K: AsRef<[u8]> + 'a,
 	{
-			unimplemented!()
+		unimplemented!("TODO call db which will remove");
 	}
 
 	fn combine_payload<I, K>(
