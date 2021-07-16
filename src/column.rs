@@ -611,13 +611,11 @@ impl Column {
 
 pub(crate) fn hash_utils(key: &[u8], attach_key: bool, uniform_keys: bool, no_indexing: bool, salt: &Option<Salt>) -> Key {
 	if no_indexing {
-		let mut k = [0u8; 8];
-		k.copy_from_slice(&key[0..8]);
-		use std::convert::TryInto;
-		Key::WithKey(u64::from_be_bytes((k).try_into().unwrap()), Default::default())
+		let address = Address::from_be_slice(&key[0..8]);
+		Key::WithKey(address.as_u64(), Default::default())
 	} else if attach_key  {
 		let mut k = [0u8; 8];
-		if uniform_keys || no_indexing {
+		if uniform_keys {
 			k.copy_from_slice(&key[0..8]);
 		} else if let Some(salt) = &salt {
 			k.copy_from_slice(blake2_rfc::blake2b::blake2b(8, &salt[..], &key).as_bytes());

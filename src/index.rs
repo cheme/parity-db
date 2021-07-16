@@ -101,6 +101,12 @@ impl Address {
 		Address(a)
 	}
 
+	pub fn from_be_slice(a: &[u8]) -> Address {
+		let mut k = [0u8; 8];
+		k.copy_from_slice(&a[0..8]);
+		Address(u64::from_be_bytes((a).try_into().unwrap()))
+	}
+
 	pub fn offset(&self) -> u64 {
 		self.0 >> 4
 	}

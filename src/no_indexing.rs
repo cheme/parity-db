@@ -51,6 +51,7 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use crate::db::DbHandle;
+use crate::index::Address;
 use parking_lot::{Condvar, Mutex};
 
 pub(crate) type HandleId = u64;
@@ -81,7 +82,20 @@ pub struct ColFreeIdHandleCommitPayload {
 	// with previous element being n - 1.
 	// To avoid useless update, this contains next item of empty that
 	// do not have n + 1 as next.
+	// TODO fuse with free_list after testing
 	filled: Vec<(u64, u64)>,
+}
+
+impl ColFreeIdHandleCommitPayload {
+	fn next_removed(&self, pos: u64) -> Option<u64> {
+		if let Ok(ix) = self.free_list.binary_search_by_key(&pos, |i| i.0) {
+			return Some(self.free_list[ix].1);
+		}
+		if let Ok(ix) = self.filled.binary_search_by_key(&pos, |i| i.0) {
+			return Some(self.filled[ix].1);
+		}
+		None
+	}
 }
 
 /// Handle to the index management for querying new ids.
@@ -159,7 +173,8 @@ impl FreeIdHandle {
 	/// Release fetched ids.
 	fn drop_handle(self) { }
 
-	fn extract_commit_payload<'a, I, K>(&mut self, changes: &'a I) -> FreeIdHandleCommitPayload
+	// Can fail if incorrect size key in payload.
+	fn extract_commit_payload<'a, I, K>(&mut self, changes: &'a I) -> Option<FreeIdHandleCommitPayload>
 	where
 		I: Iterator<Item=&'a (ColId, K, Option<Value>)>,
 		K: AsRef<[u8]> + 'a,
@@ -175,23 +190,41 @@ impl FreeIdHandle {
 		I: IntoIterator<Item=(ColId, K, Option<Value>)>,
 		K: AsRef<[u8]>,
 	{
-		changes.into_iter().map(|(col, key, value)| {
-			unimplemented!("TODO feed from payload");
-			(col, ExtendedKey::U64BE(key), value)
+		changes.into_iter().map(move |(col, key, value)| {
+			let key = if let Some(ids) = payload.0.get(&col) {
+				let address = Address::from_be_slice(&key.as_ref()[0..8]);
+				let size_tier = address.size_tier();
+				let address = address.as_u64();
+				if let Some(next) = ids.get(size_tier as usize)
+					.and_then(|t| t.next_removed(address)) {
+					let mut buf = [0; 16];
+					buf[0..8].copy_from_slice(&address.to_be_bytes()[..]);
+					buf[8..16].copy_from_slice(&next.to_be_bytes()[..]);
+					ExtendedKey::U64BEOnFree(buf)
+				} else {
+					ExtendedKey::U64BE(key)
+				}
+			} else {
+				ExtendedKey::Full(key)
+			};
+			(col, key, value)
 		})
 	}
 }
 
 enum ExtendedKey<K> {
-	// 4 bytes u64 index
+	// key from standard column.
+	Full(K),
+	// 8 bytes u64 index. TODO consider copying in [u8; 8] ?
 	U64BE(K),
-	// 4 bytes u64 index, and 4 byte next free list index. 
+	// 8 bytes u64 index, and 8 byte next free list index. 
 	U64BEOnFree([u8; 16]),
 }
 
 impl<K: AsRef<[u8]>> AsRef<[u8]> for ExtendedKey<K> {
 	fn as_ref(&self) -> &[u8] {
 		match self {
+			ExtendedKey::Full(k) => k.as_ref(),
 			ExtendedKey::U64BE(k) => k.as_ref(),
 			ExtendedKey::U64BEOnFree(k) => k.as_ref(),
 		}
