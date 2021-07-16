@@ -63,10 +63,11 @@ use crate::{
 	Key,
 	error::Result,
 	column::ColId,
-	log::{LogQuery, LogReader, LogWriter},
+	log::{LogQuery, LogReader, LogWriter, LogOverlays},
 	display::hex,
 	options::ColumnOptions as Options,
 };
+use parking_lot::RwLock;
 
 pub const SIZE_TIERS: usize = 16;
 pub const SIZE_TIERS_BITS: u8 = 4;
@@ -546,7 +547,7 @@ impl ValueTable {
 		return Ok(next);
 	}
 
-	pub fn read_next_free_no_log(&self, index: u64) -> Result<u64> {
+	pub fn read_next_free_no_indexing(&self, index: u64, log: &RwLock<LogOverlays>) -> Result<u64> {
 		let mut buf = PartialEntry::new();
 		self.read_at(&mut buf.1, index * self.entry_size as u64)?;
 		buf.skip_size();

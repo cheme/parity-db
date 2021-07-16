@@ -603,9 +603,9 @@ impl Column {
 		self.tables.read().value[table_ix as usize].current_free_table_state()
 	}
 
-	pub fn read_next_free(&self, table_ix: u8, free: u64, log: &RwLock<LogOverlays>) -> u64 {
+	pub fn read_next_free_no_indexing(&self, table_ix: u8, free: u64, log: &RwLock<LogOverlays>) -> u64 {
 		// We read directly in table since any change in log is also contain in the manager.
-		self.tables.read().value[table_ix as usize].read_next_free_no_log(free).unwrap_or(0)
+		self.tables.read().value[table_ix as usize].read_next_free_no_indexing(free, log).unwrap_or(0)
 	}
 }
 

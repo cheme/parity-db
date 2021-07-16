@@ -764,11 +764,12 @@ pub(crate) struct DbHandle {
 
 impl DbHandle {
 	pub(crate) fn current_free_table_state(&self, col_id: ColId, table_ix: u8) -> (u64, u64) {
+		// warning this skip log so only can be use during init.
 		self.inner.columns[col_id as usize].current_free_table_state(table_ix)
 	}
 
 	pub(crate) fn read_next_free(&self, col_id: ColId, table_ix: u8, free: u64) -> u64 {
-		self.inner.columns[col_id as usize].read_next_free(table_ix, free, &*self.inner.log.overlays)
+		self.inner.columns[col_id as usize].read_next_free_no_indexing(table_ix, free, &*self.inner.log.overlays)
 	}
 
 	pub(crate) fn fetch_free_id(&self, handle_id: crate::no_indexing::HandleId, col: ColId, size_tier: u8) -> u64 {
