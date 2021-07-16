@@ -31,9 +31,22 @@
 /// Thus a free index management is defined here to allow returning
 /// index to clients and keeping a in memory view of the future (post log)
 /// indexing state.
+///
+/// Free index allows multiple write, so non complete adds on commit, in
+/// this case empty entry are added (for other write reserved ids).
+/// To ensure consistency, on commit:
+/// - write on a deleted entry is using an attached next_free info (deleted entry
+/// only contains previous_free), and just insert.
+/// - write of an empty entry after filled is stored in a temporary free list where
+/// we keep head and tail and previous entry is always n - 1, skipping filled entry.
+/// - delete of entry writes in a similar temporary free list.
+/// - on commit_end first free list is attached, then second free list is attached:
+/// keeping index changes far from head (so could be remove from cache when other concurrent
+/// handles return).
 
 
 use crate::column::ColId;
+use crate::db::Value;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -59,6 +72,18 @@ pub struct FreeIdHandle {
 	db: DbHandle,
 }
 	
+pub struct FreeIdHandleCommitPayload(BTreeMap<ColId, Vec<ColFreeIdHandleCommitPayload>>);
+
+pub struct ColFreeIdHandleCommitPayload {
+	// For update of removed entry, contains next item in free list.
+	free_list: Vec<(u64, u64)>,
+	// For insert of filled entry every item is considered as deleted
+	// with previous element being n - 1.
+	// To avoid useless update, this contains next item of empty that
+	// do not have n + 1 as next.
+	filled: Vec<(u64, u64)>,
+}
+
 /// Handle to the index management for querying new ids.
 /// On drop it releases fetched ids.
 impl FreeIdHandle {
@@ -133,6 +158,44 @@ impl FreeIdHandle {
 	
 	/// Release fetched ids.
 	fn drop_handle(self) { }
+
+	fn extract_commit_payload<'a, I, K>(&mut self, changes: &'a I) -> FreeIdHandleCommitPayload
+	where
+		I: Iterator<Item=&'a (ColId, K, Option<Value>)>,
+		K: AsRef<[u8]> + 'a,
+	{
+			unimplemented!()
+	}
+
+	fn combine_payload<I, K>(
+		changes: I,
+		payload: FreeIdHandleCommitPayload,
+	) -> impl IntoIterator<Item = (ColId, ExtendedKey<K>, Option<Value>)>
+	where
+		I: IntoIterator<Item=(ColId, K, Option<Value>)>,
+		K: AsRef<[u8]>,
+	{
+		changes.into_iter().map(|(col, key, value)| {
+			unimplemented!("TODO feed from payload");
+			(col, ExtendedKey::U64BE(key), value)
+		})
+	}
+}
+
+enum ExtendedKey<K> {
+	// 4 bytes u64 index
+	U64BE(K),
+	// 4 bytes u64 index, and 4 byte next free list index. 
+	U64BEOnFree([u8; 16]),
+}
+
+impl<K: AsRef<[u8]>> AsRef<[u8]> for ExtendedKey<K> {
+	fn as_ref(&self) -> &[u8] {
+		match self {
+			ExtendedKey::U64BE(k) => k.as_ref(),
+			ExtendedKey::U64BEOnFree(k) => k.as_ref(),
+		}
+	}
 }
 
 impl Drop for FreeIdHandle {
