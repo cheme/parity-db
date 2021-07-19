@@ -62,21 +62,21 @@ pub(crate) type HandleId = u64;
 /// WARNING this struct locks db on drop potentially
 /// resulting in deadlocks if misused.
 pub struct FreeIdHandle {
-	locked: Arc<(Mutex<Lock>, Condvar)>,
+	db: DbHandle,
 	id: HandleId,
-	col: ColId, // TODO useless since handle is for a collection?
+	col: ColId,
+	locked: Arc<(Mutex<Lock>, Condvar)>,
 	read_only: Option<Vec<Option<u64>>>, // contain filled u64 when read_only
 	locked_write: bool,
 	locked_read: bool,
 	no_need_release: bool,
 	is_ready: bool,
-	db: DbHandle,
 }
-
+/*
 // TODO something lighter than btreemap
-pub struct FreeIdHandleCommitPayload(BTreeMap<ColId, Vec<ColFreeIdHandleCommitPayload>>);
+pub(crate) struct FreeIdHandleCommitPayload(BTreeMap<ColId, Vec<ColFreeIdHandleCommitPayload>>);
 
-pub struct ColFreeIdHandleCommitPayload {
+pub(crate) struct ColFreeIdHandleCommitPayload {
 	// For update of removed entry, contains item and next item in free list.
 	free_list: Vec<(u64, u64)>,
 	// For insert of filled entry every item is considered as deleted
@@ -102,7 +102,7 @@ impl ColFreeIdHandleCommitPayload {
 		None
 	}
 }
-
+*/
 /// Handle to the index management for querying new ids.
 /// On drop it releases fetched ids.
 impl FreeIdHandle {
@@ -154,18 +154,15 @@ impl FreeIdHandle {
 	fn get_col(&self) -> ColId {
 		self.col
 	}
-
+/*
 	/// Consume free handle, but do not release fetch id.
 	/// This need to switch off `drop_handle_inner` when handle
 	/// is dropped.
-	/// TODO rather redundant with extract_commit_payload, consider removal.
-	fn commit(mut self) {
+	fn commit(mut self) -> bool {
 		self.no_need_release = true;
-		if self.read_only.is_some() {
-			return;
-		}
+		!self.read_only.is_some()
 	}
-
+*/
 	/// Release fetched ids, put the handle in a consumed state.
 	/// Should never panic (called by drop).
 	fn drop_handle_inner(&mut self) {
@@ -173,49 +170,13 @@ impl FreeIdHandle {
 			return;
 		}
 		self.db.dropped_handle(self.col, self.id);
+
+		let mut lock = self.locked.0.lock();
+		lock.release(self.id);
 	}
 	
 	/// Release fetched ids.
 	fn drop_handle(self) { }
-
-	// Can fail if incorrect size key in payload.
-	fn extract_commit_payload<'a, I, K>(&mut self, changes: &'a I) -> Option<FreeIdHandleCommitPayload>
-	where
-		I: Iterator<Item=&'a (ColId, K, Option<Value>)>,
-		K: AsRef<[u8]> + 'a,
-	{
-		unimplemented!("TODO call db which will remove");
-		self.no_need_release = true;
-	}
-
-	fn combine_payload<I, K>(
-		changes: I,
-		payload: FreeIdHandleCommitPayload,
-	) -> impl IntoIterator<Item = (ColId, ExtendedKey<K>, Option<Value>)>
-	where
-		I: IntoIterator<Item=(ColId, K, Option<Value>)>,
-		K: AsRef<[u8]>,
-	{
-		changes.into_iter().map(move |(col, key, value)| {
-			let key = if let Some(ids) = payload.0.get(&col) {
-				let address = Address::from_be_slice(&key.as_ref()[0..8]);
-				let size_tier = address.size_tier();
-				let address = address.as_u64();
-				if let Some(next) = ids.get(size_tier as usize)
-					.and_then(|t| t.next_removed(address)) {
-					let mut buf = [0; 16];
-					buf[0..8].copy_from_slice(&address.to_be_bytes()[..]);
-					buf[8..16].copy_from_slice(&next.to_be_bytes()[..]);
-					ExtendedKey::U64BEOnFree(buf)
-				} else {
-					ExtendedKey::U64BE(key)
-				}
-			} else {
-				ExtendedKey::Full(key)
-			};
-			(col, key, value)
-		})
-	}
 }
 
 enum ExtendedKey<K> {
@@ -264,12 +225,72 @@ impl IdManager {
 		}
 	}
 	pub(crate) fn dropped_handle(&mut self, handle_id: HandleId, col_id: ColId) {
-		// TODO could maintain a list of modified col per handle id and not
-		// pass it as param
 		if let Some(col) = self.columns[col_id as usize].as_mut() {
 			col.dropped_handle(handle_id)
 		}
 	}
+
+	// TODO could be more effitcient if ordered by (col, key). See commit interface.
+	pub(crate) fn commit_entry<K>(
+		&mut self,
+		col: ColId,
+		key: impl AsRef<[u8]>,
+		handle: HandleId,
+	) -> impl AsRef<[u8]>	{
+		if let Some(col) = self.columns[col as usize].as_mut() {
+			return col.commit_entry(key, handle);
+		}
+		ExtendedKey::Full(key)
+	}
+
+	// To be called after data is commited and handle has been drop to update state.
+	pub(crate) fn commit(&mut self) {
+	}
+/*
+	// Can fail if incorrect size key in payload.
+	// To be call by db commit when using handle_id.
+	pub(crate) fn extract_commit_payload<'a, I, K>(
+		&mut self,
+		changes: &'a I,
+		handles: BTreeMap<ColId, HandleId>,
+	) -> Option<FreeIdHandleCommitPayload>
+	where
+		I: Iterator<Item=&'a (ColId, K, Option<Value>)>,
+		K: AsRef<[u8]> + 'a,
+	{
+		// TODO a non iterator commit could 
+		unimplemented!("TODO call db which will remove");
+	}
+
+	fn combine_payload<I, K>(
+		changes: I,
+		payload: FreeIdHandleCommitPayload,
+	) -> impl IntoIterator<Item = (ColId, ExtendedKey<K>, Option<Value>)>
+	where
+		I: IntoIterator<Item=(ColId, K, Option<Value>)>,
+		K: AsRef<[u8]>,
+	{
+		changes.into_iter().map(move |(col, key, value)| {
+			let key = if let Some(ids) = payload.0.get(&col) {
+				let address = Address::from_be_slice(&key.as_ref()[0..8]);
+				let size_tier = address.size_tier();
+				let address = address.as_u64();
+				if let Some(next) = ids.get(size_tier as usize)
+					.and_then(|t| t.next_removed(address)) {
+					let mut buf = [0; 16];
+					buf[0..8].copy_from_slice(&address.to_be_bytes()[..]);
+					buf[8..16].copy_from_slice(&next.to_be_bytes()[..]);
+					ExtendedKey::U64BEOnFree(buf)
+				} else {
+					ExtendedKey::U64BE(key)
+				}
+			} else {
+				ExtendedKey::Full(key)
+			};
+			(col, key, value)
+		})
+	}
+*/
 }
 
 // single writer, no reads, prio on write.
@@ -341,6 +362,7 @@ struct TableIdManager {
 	filled_list: VecDeque<(u64, HandleState)>,
 }
 
+#[derive(PartialEq, Eq)]
 enum HandleState {
 	Free,
 	Used(HandleId),
@@ -378,6 +400,24 @@ impl ColIdManager {
 		}
 		id
 	}
+	fn commit_entry<K>(
+		&mut self,
+		key: K,
+		handle: HandleId,
+	) -> ExtendedKey<K>
+	where
+		K: AsRef<[u8]>,
+	{
+		if self.current_handles.contains_key(&handle) {
+			// we do not update fetched ids list (will happen on drop).
+			let address = Address::from_be_slice(&key.as_ref()[0..8]);
+			let size_tier = address.size_tier();
+			if let Some(with_next) = self.tables[size_tier as usize].commit_entry(address, handle) {
+				return with_next;
+			}
+		}
+		ExtendedKey::Full(key)
+	}
 	fn dropped_handle(&mut self, handle_id: HandleId) {
 		if let Some(fetched_ids) = self.current_handles.remove(&handle_id) {
 			for (table_ix, fetched_id) in fetched_ids.into_iter().enumerate() {
@@ -392,23 +432,93 @@ impl ColIdManager {
 }
 
 impl TableIdManager {
+	fn commit_entry<K>(
+		&mut self,
+		address: Address,
+		handle: HandleId,
+	) -> Option<ExtendedKey<K>>
+	where
+		K: AsRef<[u8]>,
+	{
+		// TODO ever indexed struct or group search, but this iter seems slow: switch btreemap and
+		// radix-tree later?? (but changed dropped_handle a bit).
+		if self.filled_list.front().map(|f| address.as_u64() >= f.0).unwrap_or(false) {
+			for filled in self.filled_list.iter_mut() {
+				if filled.0 > address.as_u64() {
+					break;
+				}
+				if let HandleState::Used(id) = &filled.1 {
+					if filled.0 == address.as_u64() {
+						return None;
+					}
+				}
+			}
+		} else {
+			let mut from = None;
+			let mut to = None;
+			for free in self.free_list.iter_mut() {
+				if from.is_none() {
+					if let HandleState::Used(id) = &free.1 {
+						if free.0 == address.as_u64() {
+							debug_assert!(id == &handle);
+							from = Some(free.0);
+							free.1 = HandleState::Consumed;
+						}
+					}
+				} else {
+					match free.1 {
+						HandleState::Consumed => (),
+						HandleState::Used(_id) => {
+							// Note that if keys where resolved ordered we could
+							// skip when id is equal to handle and just write with from.
+							to = Some(free.0);
+						},
+						HandleState::Free => {
+							to = Some(free.0);
+						},
+					}
+				}
+			}
+			match (from, to) {
+				(Some(from), Some(to)) => {
+					let mut buf = [0; 16];
+					buf[0..8].copy_from_slice(&from.to_be_bytes()[..]);
+					buf[8..16].copy_from_slice(&to.to_be_bytes()[..]);
+					return Some(ExtendedKey::U64BEOnFree(buf));
+				},
+				(None, Some(_))
+				| (Some(_), None) => unreachable!("See free list construction"),
+				_ => (),
+			}
+		}
+		debug_assert!(false);
+		None
+	}
 	fn dropped_handle(&mut self, handle_id: HandleId, fetched_ids: Vec<FetchedId>) {
 		for fetch_id in fetched_ids.into_iter().rev() {
 			match fetch_id {
 				FetchedId::Filled(ix) => {
-					if ix + 1 == self.filled_list.len() {
-						self.filled_list.pop_back();
-						self.pending_filled -= 1;
-					} else {
-						self.filled_list[ix].1 = HandleState::Free;
+					debug_assert!(&self.filled_list[ix].1 != &HandleState::Free);
+					if let HandleState::Used(id) = &self.filled_list[ix].1 {
+						debug_assert!(id == &handle_id);
+						if ix + 1 == self.filled_list.len() {
+							self.filled_list.pop_back();
+							self.pending_filled -= 1;
+						} else {
+							self.filled_list[ix].1 = HandleState::Free;
+						}
 					}
 				},
 				FetchedId::Free(ix) => {
-					if ix + 1 == self.free_list.len() {
-						self.free_list.pop_back();
-						self.pending_next_free -= 1;
-					} else {
-						self.free_list[ix].1 = HandleState::Free;
+					debug_assert!(&self.free_list[ix].1 != &HandleState::Free);
+					if let HandleState::Used(id) = &self.free_list[ix].1 {
+						debug_assert!(id == &handle_id);
+						if ix + 1 == self.free_list.len() {
+							self.free_list.pop_back();
+							self.pending_next_free -= 1;
+						} else {
+							self.free_list[ix].1 = HandleState::Free;
+						}
 					}
 				},
 		// TODO also consider dropping free list that is old (back) and with id 0 as
@@ -506,7 +616,7 @@ impl IdManager {
 				read_only: Some(vec![None; crate::table::SIZE_TIERS]),
 				locked_write: false,
 				locked_read: no_write,
-				no_need_release: false,
+				no_need_release: !no_write,
 				is_ready: !no_write,
 				db: self.db.as_ref().unwrap().clone(),
 			})
