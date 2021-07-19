@@ -771,4 +771,8 @@ impl DbHandle {
 	pub(crate) fn fetch_free_id(&self, handle_id: crate::no_indexing::HandleId, col: ColId, size_tier: u8) -> u64 {
 		self.inner.free_table_id_manager.write().fetch_free_id(handle_id, col, size_tier)
 	}
+
+	pub(crate) fn dropped_handle(&self, col_id: ColId, handle_id: crate::no_indexing::HandleId) {
+		self.inner.free_table_id_manager.write().dropped_handle(handle_id, col_id)
+	}
 }

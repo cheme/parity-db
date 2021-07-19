@@ -59,8 +59,8 @@ pub(crate) type HandleId = u64;
 /// Handle to the index management for querying new ids.
 /// On drop it releases fetched ids.
 ///
-/// WARNING this struct locks db on drop and shall allways
-/// live longer than the db.
+/// WARNING this struct locks db on drop potentially
+/// resulting in deadlocks if misused.
 pub struct FreeIdHandle {
 	locked: Arc<(Mutex<Lock>, Condvar)>,
 	id: HandleId,
@@ -72,18 +72,20 @@ pub struct FreeIdHandle {
 	is_ready: bool,
 	db: DbHandle,
 }
-	
+
+// TODO something lighter than btreemap
 pub struct FreeIdHandleCommitPayload(BTreeMap<ColId, Vec<ColFreeIdHandleCommitPayload>>);
 
 pub struct ColFreeIdHandleCommitPayload {
-	// For update of removed entry, contains next item in free list.
+	// For update of removed entry, contains item and next item in free list.
 	free_list: Vec<(u64, u64)>,
 	// For insert of filled entry every item is considered as deleted
 	// with previous element being n - 1.
-	// To avoid useless update, this contains next item of empty that
-	// do not have n + 1 as next.
-	// TODO fuse with free_list after testing
+	// To avoid useless update, this contains items and their next item when
+	// they do not use n + 1 as next.
+	// TODO consider fusing with free_list after testing
 	filled: Vec<(u64, u64)>,
+	old_filled: u64,
 }
 
 impl ColFreeIdHandleCommitPayload {
@@ -93,6 +95,9 @@ impl ColFreeIdHandleCommitPayload {
 		}
 		if let Ok(ix) = self.filled.binary_search_by_key(&pos, |i| i.0) {
 			return Some(self.filled[ix].1);
+		}
+		if pos >= self.old_filled {
+			return Some(pos + 1);
 		}
 		None
 	}
@@ -104,6 +109,7 @@ impl FreeIdHandle {
 	/// wait on read write handle if needed.
 	/// TODO put in its own struct instead of expecting
 	/// it to be call.
+	/// TODO split lock related method from others in this source file
 	fn ready(&mut self) {
 		if self.is_ready {
 			return;
@@ -119,20 +125,19 @@ impl FreeIdHandle {
 			}
 		} else if self.locked_write {
 			loop {
-				let mut first = true;
 				let mut lock = self.locked.0.lock();
-				if lock.lock_write(self.id, first) {
+				if lock.lock_write(self.id) {
 					return;
 				}
-				first = false;
 				self.locked.1.wait(&mut lock);
 			}
 		}
-		unimplemented!();
+		self.is_ready = true;
 	}
 	/// Get a new id. This synchs with the id manager.
 	fn fetch_free_id(&mut self, size_tier: u8) -> u64 {
 		if let Some(filled) = self.read_only.as_mut() {
+			// Read only mode, just return higher ids.
 			let filled = &mut filled[size_tier as usize];
 			if filled.is_none() {
 				let (current_filled, _next_free) = self.db.current_free_table_state(self.col, size_tier);
@@ -147,18 +152,18 @@ impl FreeIdHandle {
 
 	/// Collection for this handle.
 	fn get_col(&self) -> ColId {
-		unimplemented!()
+		self.col
 	}
 
-	/// Consume free handle, and but do not release fetch id.
+	/// Consume free handle, but do not release fetch id.
 	/// This need to switch off `drop_handle_inner` when handle
 	/// is dropped.
+	/// TODO rather redundant with extract_commit_payload, consider removal.
 	fn commit(mut self) {
 		self.no_need_release = true;
 		if self.read_only.is_some() {
 			return;
 		}
-		unimplemented!()
 	}
 
 	/// Release fetched ids, put the handle in a consumed state.
@@ -167,7 +172,7 @@ impl FreeIdHandle {
 		if self.no_need_release {
 			return;
 		}
-		unimplemented!()
+		self.db.dropped_handle(self.col, self.id);
 	}
 	
 	/// Release fetched ids.
@@ -180,6 +185,7 @@ impl FreeIdHandle {
 		K: AsRef<[u8]> + 'a,
 	{
 		unimplemented!("TODO call db which will remove");
+		self.no_need_release = true;
 	}
 
 	fn combine_payload<I, K>(
@@ -257,6 +263,13 @@ impl IdManager {
 			}
 		}
 	}
+	pub(crate) fn dropped_handle(&mut self, handle_id: HandleId, col_id: ColId) {
+		// TODO could maintain a list of modified col per handle id and not
+		// pass it as param
+		if let Some(col) = self.columns[col_id as usize].as_mut() {
+			col.dropped_handle(handle_id)
+		}
+	}
 }
 
 // single writer, no reads, prio on write.
@@ -293,11 +306,9 @@ impl Lock {
 		true
 	}
 
-	fn lock_write(&mut self, id: HandleId, first: bool) -> bool {
+	fn lock_write(&mut self, id: HandleId) -> bool {
 		if self.current_write.is_some() || !self.current_reads.is_empty() {
-			if first {
-				self.pending_write.push(id);
-			}
+			self.pending_write.push(id);
 			return false;
 		}
 		self.pending_write.iter().position(|i| i == &id)
@@ -312,7 +323,7 @@ impl Lock {
 struct ColIdManager {
 	col_id: ColId,
 	locked: Arc<(Mutex<Lock>, Condvar)>,
-	current_handles: BTreeMap<HandleId, FetchedIds>,
+	current_handles: BTreeMap<HandleId, Vec<FetchedIds>>,
 	free_handles: Vec<HandleId>,
 	tables: Vec<TableIdManager>,
 }
@@ -325,18 +336,23 @@ struct TableIdManager {
 	pending_filled: usize,
 	pending_next_free: usize,
 	// head is first
-	free_list: VecDeque<(u64, HandleId)>,
+	free_list: VecDeque<(u64, HandleState)>,
 	// TODO first tuple item could be len + offset.
-	filled_list: VecDeque<(u64, HandleId)>,
+	filled_list: VecDeque<(u64, HandleState)>,
 }
 
+enum HandleState {
+	Free,
+	Used(HandleId),
+	Consumed,
+}
 impl ColIdManager {
 	fn init_state(&mut self, db: &DbHandle) {
 		for table_ix in 0..crate::table::SIZE_TIERS {
 			let mut table_manager = TableIdManager::default();
 			let (filled, next_free) = db.current_free_table_state(self.col_id, table_ix as u8);
-			table_manager.free_list.push_back((next_free, 0));
-			table_manager.filled_list.push_back((filled, 0));
+			table_manager.free_list.push_back((next_free, HandleState::Free));
+			table_manager.filled_list.push_back((filled, HandleState::Free));
 		}
 	}
 	fn release(&mut self, handle_id: HandleId) {
@@ -362,31 +378,97 @@ impl ColIdManager {
 		}
 		id
 	}
+	fn dropped_handle(&mut self, handle_id: HandleId) {
+		if let Some(fetched_ids) = self.current_handles.remove(&handle_id) {
+			for (table_ix, fetched_id) in fetched_ids.into_iter().enumerate() {
+				if fetched_id.len() > 0 {
+					self.tables[table_ix].dropped_handle(handle_id, fetched_id);
+				}
+			}
+			// reuse handle
+			self.free_handles.push(handle_id);
+		}
+	}
 }
 
 impl TableIdManager {
-	fn fetch_free_id(&mut self, handle_id: crate::no_indexing::HandleId, db: &DbHandle, col_id: ColId, table_ix: u8) -> u64 {
+	fn dropped_handle(&mut self, handle_id: HandleId, fetched_ids: Vec<FetchedId>) {
+		for fetch_id in fetched_ids.into_iter().rev() {
+			match fetch_id {
+				FetchedId::Filled(ix) => {
+					if ix + 1 == self.filled_list.len() {
+						self.filled_list.pop_back();
+						self.pending_filled -= 1;
+					} else {
+						self.filled_list[ix].1 = HandleState::Free;
+					}
+				},
+				FetchedId::Free(ix) => {
+					if ix + 1 == self.free_list.len() {
+						self.free_list.pop_back();
+						self.pending_next_free -= 1;
+					} else {
+						self.free_list[ix].1 = HandleState::Free;
+					}
+				},
+		// TODO also consider dropping free list that is old (back) and with id 0 as
+		// it can be fetch again when needed: should be use with a buffer size and
+		// implemented as a maintenance method.
+		// -> would need to use offset to avoid updating all registered ix
+			}
+		}
+		/*
+		while self.free_list.front().map(|f| f.1 == handle_id).unwrap_or(false) {
+			let _ = self.free_list.pop_front();
+			self.pending_next_free -= 1;
+		}
+		for f in self.free_list.iter_mut() {
+			if f.1 == handle_id {
+				f.1 = 0;
+			}
+		}
+
+		while self.filled_list.front().map(|f| f.1 == handle_id).unwrap_or(false) {
+			let _ = self.filled_list.pop_front();
+			self.pending_filled -= 1;
+		}
+		for f in self.filled_list.iter_mut() {
+			if f.1 == handle_id {
+				f.1 = 0;
+			}
+		}
+		*/
+
+
+	}
+
+	fn fetch_free_id(&mut self, handle_id: HandleId, db: &DbHandle, col_id: ColId, table_ix: u8) -> u64 {
 		if self.free_list[self.pending_next_free].0 != 0 {
 			// read from removed list
 			if self.pending_next_free == self.free_list.len() {
 				let next = db.read_next_free(col_id, table_ix, self.free_list[self.pending_next_free].0);
-				self.free_list.push_back((next, 0));
+				self.free_list.push_back((next, HandleState::Free));
 			}
 			self.pending_next_free += 1;
-			self.free_list[self.pending_next_free - 1].1 = handle_id;
+			self.free_list[self.pending_next_free - 1].1 = HandleState::Used(handle_id);
 			self.free_list[self.pending_next_free - 1].0
 		} else {
 			// extend table
-			self.filled_list[self.pending_filled].1 = handle_id;
+			self.filled_list[self.pending_filled].1 = HandleState::Used(handle_id);
 			let result = self.filled_list[self.pending_filled].0;
-			self.filled_list.push_back((result + 1, 0));
+			self.filled_list.push_back((result + 1, HandleState::Free));
 			self.pending_filled += 1;
 			result
 		}
 	}
 }
 
-type FetchedIds = Vec<u64>;
+type FetchedIds = Vec<FetchedId>;
+
+enum FetchedId {
+	Filled(usize),
+	Free(usize),
+}
 
 impl IdManager {
 	// `single_write` to true does opt-in for locking. One must call `ready` afterward.
