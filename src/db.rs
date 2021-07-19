@@ -43,6 +43,8 @@ use crate::{
 	index::PlanOutcome,
 	options::Options,
 };
+use std::collections::BTreeMap;
+use crate::no_indexing::HandleId;
 
 // These are in memory, so we use usize
 const MAX_COMMIT_QUEUE_BYTES: usize = 16 * 1024 * 1024;
@@ -212,6 +214,17 @@ impl DbInner {
 			I: IntoIterator<Item=(ColId, K, Option<Value>)>,
 			K: AsRef<[u8]>,
 	{
+		self.commit_with_non_canonical::<I, K>(tx, Default::default())
+	}
+
+	// Commit simply adds the the data to the queue and to the overlay and
+	// exits as early as possible.
+	fn commit_with_non_canonical<I, K>(&self, tx: I, non_canonical: BTreeMap<ColId, HandleId>) -> Result<()>
+		where
+			I: IntoIterator<Item=(ColId, K, Option<Value>)>,
+			K: AsRef<[u8]>,
+	{
+	
 		{
 			let bg_err = self.bg_err.lock();
 			if let Some(err) = &*bg_err {
@@ -219,9 +232,23 @@ impl DbInner {
 			}
 		}
 
-		let commit: Vec<_> = tx.into_iter().map(
-			|(c, k, v)| (c, self.columns[c as usize].hash(k.as_ref()), v)
-		).collect();
+		let mut non_canonical_overlay = self.free_table_id_manager.write();
+		// TODO since we collect here: there is surely a way to group by col and key and have a
+		// more efficient non_canonical resolution (currently it looks up each keys).
+		let commit: Vec<_> = tx.into_iter().map(|(c, k, v)| {
+			if let Some(handle) = non_canonical.get(&c) {
+				if v.is_some() {
+					let k = non_canonical_overlay.commit_entry(c, k, *handle);
+					(c, self.columns[c as usize].hash(k.as_ref()), v)
+				} else {
+					non_canonical_overlay.removed_index(c, k.as_ref());
+					(c, self.columns[c as usize].hash(k.as_ref()), v)
+				}
+			} else {
+				(c, self.columns[c as usize].hash(k.as_ref()), v)
+			}
+		}).collect();
+		std::mem::drop(non_canonical_overlay);
 
 		{
 			let mut queue = self.commit_queue.lock();
@@ -260,6 +287,9 @@ impl DbInner {
 			queue.bytes += bytes;
 			self.signal_log_worker();
 		}
+
+		std::mem::drop(non_canonical);
+		self.free_table_id_manager.write().commit();
 		Ok(())
 	}
 

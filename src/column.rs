@@ -339,9 +339,14 @@ impl Column {
 		//TODO: return sub-chunk position in index.get
 		let tables = self.tables.upgradable_read();
 		let reindex = self.reindex.upgradable_read();
-		let existing = if self.no_indexing {
-			let address = Address::from_u64(key.index());
+		let existing = if let Key::NoIndexing(address, next_free) = key {
+			let address = Address::from_u64(*address);
 			let tier = address.size_tier();
+			if let Some(next_free) = next_free {
+				// overwrite a value of free_list
+				log::trace!(target: "parity-db", "{}: NoIndexing remove from free list {}", tables.index.id, hex(key));
+				tables.value[tier as usize].write_inner_free_list_remove(address.as_u64(), *next_free, log)?;
+			}
 			Some((&tables.index, 0, tier, address))
 		} else {
 			Self::search_all_indexes(key, &*tables, &*reindex, log)?
@@ -611,8 +616,9 @@ impl Column {
 
 pub(crate) fn hash_utils(key: &[u8], attach_key: bool, uniform_keys: bool, no_indexing: bool, salt: &Option<Salt>) -> Key {
 	if no_indexing {
-		let address = Address::from_be_slice(&key[0..8]);
-		Key::WithKey(address.as_u64(), Default::default())
+		let address = Address::from_be_slice(&key[0..8]).as_u64();
+		let free_next = (key.len() == 16).then(|| Address::from_be_slice(&key[8..16]).as_u64());
+		Key::NoIndexing(address, free_next)
 	} else if attach_key  {
 		let mut k = [0u8; 8];
 		if uniform_keys {

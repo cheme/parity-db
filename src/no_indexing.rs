@@ -37,16 +37,14 @@
 /// To ensure consistency, on commit:
 /// - write on a deleted entry is using an attached next_free info (deleted entry
 /// only contains previous_free), and just insert.
-/// - write of an empty entry after filled is stored in a temporary free list where
-/// we keep head and tail and previous entry is always n - 1, skipping filled entry.
-/// - delete of entry writes in a similar temporary free list.
-/// - on commit_end first free list is attached, then second free list is attached:
-/// keeping index changes far from head (so could be remove from cache when other concurrent
-/// handles return).
+/// - entries after filled are seen as a contigus free list and updated consequentyl.
+/// - delete of entry writes in a detached list that is only written after the free list
+/// when all is committed.
+/// - then detached delete list is written at last fetched id and this management is updated
+/// to use this as first free list pointer.
 
 
 use crate::column::ColId;
-use crate::db::Value;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -231,7 +229,7 @@ impl IdManager {
 	}
 
 	// TODO could be more effitcient if ordered by (col, key). See commit interface.
-	pub(crate) fn commit_entry<K>(
+	pub(crate) fn commit_entry(
 		&mut self,
 		col: ColId,
 		key: impl AsRef<[u8]>,
@@ -243,8 +241,18 @@ impl IdManager {
 		ExtendedKey::Full(key)
 	}
 
+	pub(crate) fn removed_index(
+		&mut self,
+		col: ColId,
+		key: &[u8],
+	) {
+		if let Some(col) = self.columns[col as usize].as_mut() {
+			return col.removed_index(key);
+		}
+	}
 	// To be called after data is commited and handle has been drop to update state.
 	pub(crate) fn commit(&mut self) {
+		// TODO clean up of back of free.
 	}
 /*
 	// Can fail if incorrect size key in payload.
@@ -352,14 +360,8 @@ struct ColIdManager {
 #[derive(Default)]
 struct TableIdManager {
 	filled: u64,
-	next_free: usize,
-	// TODO could be last_filled
-	pending_filled: usize,
-	pending_next_free: usize,
 	// head is first
 	free_list: VecDeque<(u64, HandleState)>,
-	// TODO first tuple item could be len + offset.
-	filled_list: VecDeque<(u64, HandleState)>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -374,7 +376,6 @@ impl ColIdManager {
 			let mut table_manager = TableIdManager::default();
 			let (filled, next_free) = db.current_free_table_state(self.col_id, table_ix as u8);
 			table_manager.free_list.push_back((next_free, HandleState::Free));
-			table_manager.filled_list.push_back((filled, HandleState::Free));
 		}
 	}
 	fn release(&mut self, handle_id: HandleId) {
@@ -418,6 +419,16 @@ impl ColIdManager {
 		}
 		ExtendedKey::Full(key)
 	}
+	pub(crate) fn removed_index(
+		&mut self,
+		key: &[u8],
+	) {
+		let address = Address::from_be_slice(&key.as_ref()[0..8]);
+		let size_tier = address.size_tier();
+		let address = address.as_u64();
+		self.tables[size_tier as usize].removed_index(address);
+	}
+
 	fn dropped_handle(&mut self, handle_id: HandleId) {
 		if let Some(fetched_ids) = self.current_handles.remove(&handle_id) {
 			for (table_ix, fetched_id) in fetched_ids.into_iter().enumerate() {
@@ -442,90 +453,63 @@ impl TableIdManager {
 	{
 		// TODO ever indexed struct or group search, but this iter seems slow: switch btreemap and
 		// radix-tree later?? (but changed dropped_handle a bit).
-		if self.filled_list.front().map(|f| address.as_u64() >= f.0).unwrap_or(false) {
-			for filled in self.filled_list.iter_mut() {
-				if filled.0 > address.as_u64() {
-					break;
-				}
-				if let HandleState::Used(id) = &filled.1 {
-					if filled.0 == address.as_u64() {
-						return None;
+		let mut from = None;
+		let mut to = None;
+		for free in self.free_list.iter_mut() {
+			if from.is_none() {
+				if let HandleState::Used(id) = &free.1 {
+					if free.0 == address.as_u64() {
+						debug_assert!(id == &handle);
+						from = Some(free.0);
+						free.1 = HandleState::Consumed;
 					}
 				}
-			}
-		} else {
-			let mut from = None;
-			let mut to = None;
-			for free in self.free_list.iter_mut() {
-				if from.is_none() {
-					if let HandleState::Used(id) = &free.1 {
-						if free.0 == address.as_u64() {
-							debug_assert!(id == &handle);
-							from = Some(free.0);
-							free.1 = HandleState::Consumed;
-						}
-					}
-				} else {
-					match free.1 {
-						HandleState::Consumed => (),
-						HandleState::Used(_id) => {
-							// Note that if keys where resolved ordered we could
-							// skip when id is equal to handle and just write with from.
-							to = Some(free.0);
-						},
-						HandleState::Free => {
-							to = Some(free.0);
-						},
-					}
+			} else {
+				match free.1 {
+					HandleState::Consumed => (),
+					HandleState::Used(_id) => {
+						// Note that if keys where resolved ordered we could
+						// skip when id is equal to handle and just write with from.
+						to = Some(free.0);
+					},
+					HandleState::Free => {
+						to = Some(free.0);
+					},
 				}
 			}
-			match (from, to) {
-				(Some(from), Some(to)) => {
-					let mut buf = [0; 16];
-					buf[0..8].copy_from_slice(&from.to_be_bytes()[..]);
-					buf[8..16].copy_from_slice(&to.to_be_bytes()[..]);
-					return Some(ExtendedKey::U64BEOnFree(buf));
-				},
-				(None, Some(_))
-				| (Some(_), None) => unreachable!("See free list construction"),
-				_ => (),
-			}
+		}
+		match (from, to) {
+			(Some(from), Some(to)) => {
+				let mut buf = [0; 16];
+				buf[0..8].copy_from_slice(&from.to_be_bytes()[..]);
+				buf[8..16].copy_from_slice(&to.to_be_bytes()[..]);
+				return Some(ExtendedKey::U64BEOnFree(buf));
+			},
+			(None, Some(_))
+			| (Some(_), None) => unreachable!("See free list construction"),
+			_ => (),
 		}
 		debug_assert!(false);
 		None
 	}
-	fn dropped_handle(&mut self, handle_id: HandleId, fetched_ids: Vec<FetchedId>) {
-		for fetch_id in fetched_ids.into_iter().rev() {
-			match fetch_id {
-				FetchedId::Filled(ix) => {
-					debug_assert!(&self.filled_list[ix].1 != &HandleState::Free);
-					if let HandleState::Used(id) = &self.filled_list[ix].1 {
-						debug_assert!(id == &handle_id);
-						if ix + 1 == self.filled_list.len() {
-							self.filled_list.pop_back();
-							self.pending_filled -= 1;
-						} else {
-							self.filled_list[ix].1 = HandleState::Free;
-						}
-					}
-				},
-				FetchedId::Free(ix) => {
-					debug_assert!(&self.free_list[ix].1 != &HandleState::Free);
-					if let HandleState::Used(id) = &self.free_list[ix].1 {
-						debug_assert!(id == &handle_id);
-						if ix + 1 == self.free_list.len() {
-							self.free_list.pop_back();
-							self.pending_next_free -= 1;
-						} else {
-							self.free_list[ix].1 = HandleState::Free;
-						}
-					}
-				},
-		// TODO also consider dropping free list that is old (back) and with id 0 as
-		// it can be fetch again when needed: should be use with a buffer size and
-		// implemented as a maintenance method.
-		// -> would need to use offset to avoid updating all registered ix
+	fn removed_index(&mut self, address: u64) {
+		self.free_list.push_front((address, HandleState::Free));
+	}
+	fn dropped_handle(&mut self, handle_id: HandleId, fetched_ids: Vec<usize>) {
+		for ix in fetched_ids.into_iter().rev() {
+			debug_assert!(&self.free_list[ix].1 != &HandleState::Free);
+			if let HandleState::Used(id) = &self.free_list[ix].1 {
+				debug_assert!(id == &handle_id);
+				if ix + 1 == self.free_list.len() {
+					unreachable!("free list contains a next free (0 if empty).");
+				} else {
+					self.free_list[ix].1 = HandleState::Free;
+				}
 			}
+			// TODO also consider dropping free list that is old (back) and with id 0 as
+			// it can be fetch again when needed: should be use with a buffer size and
+			// implemented as a maintenance method.
+			// -> would need to use offset to avoid updating all registered ix
 		}
 		/*
 		while self.free_list.front().map(|f| f.1 == handle_id).unwrap_or(false) {
@@ -548,37 +532,35 @@ impl TableIdManager {
 			}
 		}
 		*/
-
-
 	}
 
 	fn fetch_free_id(&mut self, handle_id: HandleId, db: &DbHandle, col_id: ColId, table_ix: u8) -> u64 {
-		if self.free_list[self.pending_next_free].0 != 0 {
-			// read from removed list
-			if self.pending_next_free == self.free_list.len() {
-				let next = db.read_next_free(col_id, table_ix, self.free_list[self.pending_next_free].0);
-				self.free_list.push_back((next, HandleState::Free));
+		let len = self.free_list.len();
+		// TODO manage ix of free to avoid this iters.
+		for (ix, free) in self.free_list.iter_mut().enumerate() {
+			if ix + 1 != len && free.1 == HandleState::Free {
+				free.1 = HandleState::Used(handle_id);
+				return free.0;
 			}
-			self.pending_next_free += 1;
-			self.free_list[self.pending_next_free - 1].1 = HandleState::Used(handle_id);
-			self.free_list[self.pending_next_free - 1].0
-		} else {
-			// extend table
-			self.filled_list[self.pending_filled].1 = HandleState::Used(handle_id);
-			let result = self.filled_list[self.pending_filled].0;
-			self.filled_list.push_back((result + 1, HandleState::Free));
-			self.pending_filled += 1;
-			result
 		}
+	
+		if let Some(next) = self.free_list.back() {
+			if next.0 != 0 {
+				// read from removed list
+				let next = db.read_next_free(col_id, table_ix, next.0);
+				self.free_list.push_back((next, HandleState::Free));
+				self.free_list[len - 1].1 = HandleState::Used(handle_id);
+				return self.free_list[len - 1].0;
+			}
+		};
+		// extend from filled
+		self.free_list.push_front((self.filled, HandleState::Used(handle_id)));
+		self.filled += 1;
+		self.filled - 1
 	}
 }
 
-type FetchedIds = Vec<FetchedId>;
-
-enum FetchedId {
-	Filled(usize),
-	Free(usize),
-}
+type FetchedIds = Vec<usize>;
 
 impl IdManager {
 	// `single_write` to true does opt-in for locking. One must call `ready` afterward.
@@ -635,5 +617,18 @@ impl IdManager {
 		} else {
 			0
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+
+	#[test]
+	fn test_no_locks() {
+
+	}
+
+	#[test]
+	fn test_with_locks() {
 	}
 }

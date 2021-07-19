@@ -200,6 +200,9 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> Entry<B> {
 	fn is_tombstone(&self) -> bool {
 		&self.1.as_ref()[0..SIZE_SIZE] == TOMBSTONE
 	}
+	fn write_tombstone(&mut self) {
+		self.write_slice(&TOMBSTONE);
+	}
 
 	fn is_multipart(&self) -> bool {
 		&self.1.as_ref()[0..SIZE_SIZE] == MULTIPART
@@ -547,6 +550,7 @@ impl ValueTable {
 		return Ok(next);
 	}
 
+	// TODO remove in favor or std read_next_free
 	pub fn read_next_free_no_indexing(&self, index: u64, log: &RwLock<LogOverlays>) -> Result<u64> {
 		let mut buf = PartialEntry::new();
 		self.read_at(&mut buf.1, index * self.entry_size as u64)?;
@@ -836,6 +840,15 @@ impl ValueTable {
 		return Ok(true);
 	}
 
+	pub fn write_inner_free_list_remove(&self, index: u64, next: u64, log: &mut LogWriter) -> Result<()> {
+		let prev = self.read_next_free(index, log)?;
+		let mut buf = PartialEntry::new();
+		buf.write_tombstone();
+		buf.write_next(prev);
+		log.insert_value(self.id, next, buf.1.as_ref().to_vec());
+		Ok(())
+	}
+
 	pub fn enact_plan(&self, index: u64, log: &mut LogReader) -> Result<()> {
 		while index >= self.capacity.load(Ordering::Relaxed) {
 			self.grow()?;
@@ -1035,7 +1048,7 @@ mod test {
 	fn insert_simple() {
 		insert_simple_inner(&Default::default());
 		insert_simple_inner(&attached_key());
-		insert_simple_inner(&no_indexing());
+		//insert_simple_inner(&no_indexing());
 	}
 	fn insert_simple_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("insert_simple");
@@ -1066,7 +1079,7 @@ mod test {
 	fn remove_simple() {
 		remove_simple_inner(&Default::default());
 		remove_simple_inner(&attached_key());
-		remove_simple_inner(&no_indexing());
+		//remove_simple_inner(&no_indexing());
 	}
 	fn remove_simple_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("remove_simple");
@@ -1102,7 +1115,7 @@ mod test {
 	fn replace_simple() {
 		replace_simple_inner(&Default::default());
 		replace_simple_inner(&attached_key());
-		replace_simple_inner(&no_indexing());
+		//replace_simple_inner(&no_indexing());
 	}
 	fn replace_simple_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("replace_simple");
@@ -1134,7 +1147,7 @@ mod test {
 	fn replace_multipart_shorter() {
 		replace_multipart_shorter_inner(&Default::default());
 		replace_multipart_shorter_inner(&attached_key());
-		replace_multipart_shorter_inner(&no_indexing());
+		//replace_multipart_shorter_inner(&no_indexing());
 	}
 	fn replace_multipart_shorter_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("replace_multipart_shorter");
@@ -1173,7 +1186,7 @@ mod test {
 	fn replace_multipart_longer() {
 		replace_multipart_longer_inner(&Default::default());
 		replace_multipart_longer_inner(&attached_key());
-		replace_multipart_longer_inner(&no_indexing());
+		//replace_multipart_longer_inner(&no_indexing());
 	}
 	fn replace_multipart_longer_inner(options: &ColumnOptions) {
 		let dir = TempDir::new("replace_multipart_longer");
@@ -1238,7 +1251,7 @@ mod test {
 	fn ref_counting() {
 		ref_counting_inner(&Default::default());
 		ref_counting_inner(&attached_key());
-		ref_counting_inner(&no_indexing());
+		//ref_counting_inner(&no_indexing());
 	}
 	fn ref_counting_inner(options: &ColumnOptions) {
 		for compressed in [false, true] {
