@@ -81,7 +81,7 @@ impl Key {
 			Key::WithKey(_hash, full) => {
 				varint_encoded_len(full.len() as u64) + full.len()
 			},
-			Key::NoIndexing(_hash, _next_free) => unreachable!("No key in no indexing"),
+			Key::NoIndexing(_hash, _next_free) => 0,
 		}
 	}
 

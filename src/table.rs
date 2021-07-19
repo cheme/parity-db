@@ -661,7 +661,7 @@ impl ValueTable {
 				(SIZE_SIZE, remainder)
 			};
 			let init_offset = buf.offset();
-			if offset == 0 && key_remaining > 0 {
+			if offset == 0 && (key_remaining > 0 || self.no_indexing) {
 				if key_remaining == encoded_key_len {
 					// first rc.
 					let rc = if compressed {
@@ -676,7 +676,6 @@ impl ValueTable {
 						buf.write_slice(encoded);
 						key_remaining -= encoded.len();
 					} else if self.no_indexing {
-						key_remaining = 0;
 					} else {
 						buf.write_slice(key.table_slice());
 						key_remaining = 0;

@@ -44,7 +44,7 @@ use crate::{
 	options::Options,
 };
 use std::collections::BTreeMap;
-use crate::no_indexing::HandleId;
+use crate::no_indexing::{HandleId, FreeIdHandle};
 
 // These are in memory, so we use usize
 const MAX_COMMIT_QUEUE_BYTES: usize = 16 * 1024 * 1024;
@@ -219,7 +219,7 @@ impl DbInner {
 
 	// Commit simply adds the the data to the queue and to the overlay and
 	// exits as early as possible.
-	fn commit_with_non_canonical<I, K>(&self, tx: I, non_canonical: BTreeMap<ColId, HandleId>) -> Result<()>
+	fn commit_with_non_canonical<I, K>(&self, tx: I, non_canonical: BTreeMap<ColId, FreeIdHandle>) -> Result<()>
 		where
 			I: IntoIterator<Item=(ColId, K, Option<Value>)>,
 			K: AsRef<[u8]>,
@@ -238,7 +238,7 @@ impl DbInner {
 		let commit: Vec<_> = tx.into_iter().map(|(c, k, v)| {
 			if let Some(handle) = non_canonical.get(&c) {
 				if v.is_some() {
-					let k = non_canonical_overlay.commit_entry(c, k, *handle);
+					let k = non_canonical_overlay.commit_entry(c, k, handle.id);
 					(c, self.columns[c as usize].hash(k.as_ref()), v)
 				} else {
 					non_canonical_overlay.removed_index(c, k.as_ref());
@@ -703,6 +703,14 @@ impl Db {
 		self.inner.get_size(col, key)
 	}
 
+	pub fn commit_with_non_canonical<I, K>(&self, tx: I, non_canonical: BTreeMap<ColId, FreeIdHandle>) -> Result<()>
+		where
+			I: IntoIterator<Item=(ColId, K, Option<Value>)>,
+			K: AsRef<[u8]>,
+	{
+		self.inner.commit_with_non_canonical(tx, non_canonical)
+	}
+	
 	pub fn commit<I, K>(&self, tx: I) -> Result<()>
 	where
 		I: IntoIterator<Item=(ColId, K, Option<Value>)>,
@@ -768,6 +776,12 @@ impl Db {
 		db.flush_logs(0)?;
 		Ok(())
 	}
+	pub fn get_handle(&self, col_id: ColId, single_write: bool) -> Option<crate::no_indexing::FreeIdHandle> {
+		self.inner.free_table_id_manager.write().get_handle(col_id, single_write)
+	}
+	pub fn get_read_only_handle(&mut self, col_id: ColId, no_write: bool) -> Option<crate::no_indexing::FreeIdHandle> {
+		self.inner.free_table_id_manager.write().get_read_only_handle(col_id, no_write)
+	}
 }
 
 impl Drop for Db {
@@ -804,5 +818,14 @@ impl DbHandle {
 
 	pub(crate) fn dropped_handle(&self, col_id: ColId, handle_id: crate::no_indexing::HandleId) {
 		self.inner.free_table_id_manager.write().dropped_handle(handle_id, col_id)
+	}
+	pub(crate) fn get_size_tier(&self, col_id: ColId, len: usize) -> u8 {
+		let target_tier = self.inner.options.columns[col_id as usize].sizes.iter().position(|t| len <= *t as usize);
+		match target_tier {
+			Some(tier) => tier as u8,
+			None => {
+				15
+			}
+		}
 	}
 }

@@ -61,7 +61,7 @@ pub(crate) type HandleId = u64;
 /// resulting in deadlocks if misused.
 pub struct FreeIdHandle {
 	db: DbHandle,
-	id: HandleId,
+	pub(crate) id: HandleId,
 	col: ColId,
 	locked: Arc<(Mutex<Lock>, Condvar)>,
 	read_only: Option<Vec<Option<u64>>>, // contain filled u64 when read_only
@@ -133,7 +133,12 @@ impl FreeIdHandle {
 		self.is_ready = true;
 	}
 	/// Get a new id. This synchs with the id manager.
-	fn fetch_free_id(&mut self, size_tier: u8) -> u64 {
+	fn fetch_free_id(&mut self, value_size: usize) -> u64 {
+		let size_tier = self.db.get_size_tier(self.col, value_size);
+		self.fetch_free_id_size_tier(size_tier)
+	}
+	/// Get a new id. This synchs with the id manager.
+	fn fetch_free_id_size_tier(&mut self, size_tier: u8) -> u64 {
 		if let Some(filled) = self.read_only.as_mut() {
 			// Read only mode, just return higher ids.
 			let filled = &mut filled[size_tier as usize];
@@ -172,7 +177,7 @@ impl FreeIdHandle {
 		let mut lock = self.locked.0.lock();
 		lock.release(self.id);
 	}
-	
+
 	/// Release fetched ids.
 	fn drop_handle(self) { }
 }
@@ -209,8 +214,8 @@ pub(crate) struct IdManager {
 
 impl IdManager {
 	pub(crate) fn new(options: &crate::options::Options) -> Self {
-		let columns = options.columns.iter()
-			.map(|c| c.no_indexing.then(|| ColIdManager::default()))
+		let columns = options.columns.iter().enumerate()
+			.map(|(id, c)| c.no_indexing.then(|| ColIdManager::new(id as u8)))
 			.collect();
 		IdManager { db: None, columns }
 	}
@@ -348,7 +353,6 @@ impl Lock {
 }
 
 /// Id management view.
-#[derive(Default)]
 struct ColIdManager {
 	col_id: ColId,
 	locked: Arc<(Mutex<Lock>, Condvar)>,
@@ -357,8 +361,25 @@ struct ColIdManager {
 	tables: Vec<TableIdManager>,
 }
 
+impl ColIdManager {
+	fn new(col_id: ColId) -> Self {
+		let mut tables = Vec::with_capacity(16);
+		for _ in 0..16 {
+			tables.push(TableIdManager::default());
+		}
+		ColIdManager {
+			col_id,
+			locked: Default::default(),
+			current_handles: Default::default(),
+			free_handles: Default::default(),
+			tables,
+		}
+	}
+}
+
 #[derive(Default)]
 struct TableIdManager {
+	size_tier: u8,
 	filled: u64,
 	// head is first
 	free_list: VecDeque<(u64, HandleState)>,
@@ -373,9 +394,11 @@ enum HandleState {
 impl ColIdManager {
 	fn init_state(&mut self, db: &DbHandle) {
 		for table_ix in 0..crate::table::SIZE_TIERS {
-			let mut table_manager = TableIdManager::default();
+			let mut table_manager = &mut self.tables[table_ix];
 			let (filled, next_free) = db.current_free_table_state(self.col_id, table_ix as u8);
+			table_manager.filled = filled;
 			table_manager.free_list.push_back((next_free, HandleState::Free));
+			table_manager.size_tier = table_ix as u8;
 		}
 	}
 	fn release(&mut self, handle_id: HandleId) {
@@ -384,21 +407,21 @@ impl ColIdManager {
 			self.locked.1.notify_all();
 		}
 	}
-	fn next_handle_id(&mut self, single_write: bool, read_lock: bool) -> HandleId {
+	fn next_handle_id(&mut self, write: bool, single_write: bool, read_lock: bool) -> HandleId {
+		if !write && !read_lock {
+			return 0;
+		}
 		debug_assert!(!(single_write && read_lock));
 		let id = if let Some(id) = self.free_handles.pop() {
 			id
 		} else {
 			if let Some((id, _)) = self.current_handles.iter().next_back() {
-				*id
+				*id + 1
 			} else {
-				1 // 0 is reserved
+				0
 			}
 		};
-		if single_write {
-		} else if read_lock {
-			self.free_handles.push(id);
-		}
+		self.current_handles.insert(id, Default::default());
 		id
 	}
 	fn commit_entry<K>(
@@ -536,14 +559,15 @@ impl TableIdManager {
 
 	fn fetch_free_id(&mut self, handle_id: HandleId, db: &DbHandle, col_id: ColId, table_ix: u8) -> u64 {
 		let len = self.free_list.len();
+		debug_assert!(len > 0);
 		// TODO manage ix of free to avoid this iters.
 		for (ix, free) in self.free_list.iter_mut().enumerate() {
-			if ix + 1 != len && free.1 == HandleState::Free {
+			if ix + 1 != len && free.1 == HandleState::Free && free.0 != 0 {
 				free.1 = HandleState::Used(handle_id);
 				return free.0;
 			}
 		}
-	
+
 		if let Some(next) = self.free_list.back() {
 			if next.0 != 0 {
 				// read from removed list
@@ -566,7 +590,7 @@ impl IdManager {
 	// `single_write` to true does opt-in for locking. One must call `ready` afterward.
 	pub fn get_handle(&mut self, col_id: ColId, single_write: bool) -> Option<FreeIdHandle> {
 		if let Some(col) = self.columns[col_id as usize].as_mut() {
-			let handle_id = col.next_handle_id(single_write, false);
+			let handle_id = col.next_handle_id(true, single_write, false);
 			Some(FreeIdHandle {
 				locked: col.locked.clone(),
 				id: handle_id,
@@ -589,7 +613,7 @@ impl IdManager {
 			let handle_id = if !no_write {
 				0 // unmanaged.
 			} else {
-				col.next_handle_id(false, true)
+				col.next_handle_id(false, false, true)
 			};
 			Some(FreeIdHandle {
 				locked: col.locked.clone(),
@@ -622,10 +646,49 @@ impl IdManager {
 
 #[cfg(test)]
 mod tests {
+	use crate::options::{Options, ColumnOptions};
+	use std::collections::BTreeMap;
+
+	fn options(name: &str) -> Options {
+		env_logger::try_init().ok();
+		let mut path: std::path::PathBuf = std::env::temp_dir();
+		path.push("parity-db-test");
+		path.push(name);
+		if path.exists() {
+			std::fs::remove_dir_all(&path).unwrap();
+		}
+		std::fs::create_dir_all(&path).unwrap();
+
+		let mut col_option = ColumnOptions::default();
+		col_option.no_indexing = true;
+		Options {
+			path,
+			columns: vec![col_option],
+			sync: false,
+			stats: false,
+		}
+	}
+
 
 	#[test]
 	fn test_no_locks() {
-
+		let options = options("test_no_lock");
+		let db = crate::Db::open(&options).unwrap();
+		let mut writer = BTreeMap::<u64, Option<Vec<u8>>>::new();
+		{
+			let mut handle = db.get_handle(0, false).unwrap();
+			handle.ready();
+			for i in 0u8..5 {
+				let mut value = b"test_value".to_vec();
+				value.push(i);
+				writer.insert(handle.fetch_free_id(value.len()), Some(value));
+			}
+			let mut handle_map = BTreeMap::new();
+			handle_map.insert(0, handle);
+			db.commit_with_non_canonical(writer.iter().map(|(id, v)| {
+				(0, id.to_be_bytes().to_vec(), v.clone()) 
+			}), handle_map);
+		}
 	}
 
 	#[test]

@@ -208,7 +208,6 @@ impl Column {
 	}
 
 	pub fn hash(&self, key: &[u8]) -> Key {
-		assert!(!self.no_indexing);
 		hash_utils(key, self.attach_key, self.uniform_keys, self.no_indexing, &self.salt)
 	}
 
