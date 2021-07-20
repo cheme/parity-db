@@ -388,13 +388,13 @@ impl ColIdManager {
 #[derive(Default, Clone, Debug)] // TODO clone and debug test only
 pub(crate) struct TableIdManager {
 	size_tier: u8,
-	filled: u64,
+	pub(crate) filled: u64,
 	// head is first
-	free_list: VecDeque<(u64, HandleState)>,
+	pub(crate) free_list: VecDeque<(u64, HandleState)>,
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)] // TODO clone and debug test only
-enum HandleState {
+pub(crate) enum HandleState {
 	Free,
 	Used(HandleId),
 	Consumed,
@@ -508,9 +508,11 @@ impl TableIdManager {
 						// Note that if keys where resolved ordered we could
 						// skip when id is equal to handle and just write with from.
 						to = Some(Address::new(free.0, self.size_tier));
+						break;
 					},
 					HandleState::Free => {
 						to = Some(Address::new(free.0, self.size_tier));
+						break;
 					},
 				}
 			}
@@ -696,6 +698,7 @@ mod tests {
 			columns: vec![col_option],
 			sync: false,
 			stats: false,
+			skip_commit_queue: true,
 		}
 	}
 
@@ -811,6 +814,8 @@ mod tests {
 		
 		check_state(&db, &state);
 
+		let _ = db.clone_check_table_id_manager(0, 0, true).unwrap();
+
 		let handle = prepare_add(&db, None, &mut state, &mut writer, (6, 10));
 		// 5 and 10
 		let handle = prepare_remove(&db, Some(handle), &mut state, &mut writer, (4, 7));
@@ -821,6 +826,11 @@ mod tests {
 		wait_log();
 		check_state(&db, &state);
 
+		for i in 0..3 { wait_log() };
+		let free_list = db.clone_check_table_id_manager(0, 0, true).unwrap();
+		panic!("{:?}", free_list);
+
+
 		let handle = prepare_add(&db, None, &mut state, &mut writer, (11, 13));
 
 		commit_with_handle(&db, handle, &mut writer);
@@ -829,7 +839,8 @@ mod tests {
 		wait_log();
 		check_state(&db, &state);
 
-		let free_list = db.clone_table_id_manager(0, 0).unwrap();
+		for i in 0..3 { wait_log() };
+		let free_list = db.clone_check_table_id_manager(0, 0, true).unwrap();
 		panic!("{:?}", free_list);
 	}
 

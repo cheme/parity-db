@@ -615,6 +615,11 @@ impl Column {
 		// We read directly in table since any change in log is also contain in the manager.
 		self.tables.read().value[table_ix as usize].read_next_free_no_indexing(free, log).unwrap_or(0)
 	}
+
+	#[cfg(test)]
+	pub(crate) fn check_free_list(&self, table_ix: u8, ids: &crate::no_indexing::TableIdManager, log: &RwLock<LogOverlays>) -> bool {
+		self.tables.read().value[table_ix as usize].check_free_list(ids, log)
+	}
 }
 
 pub(crate) fn hash_utils(key: &[u8], attach_key: bool, uniform_keys: bool, no_indexing: bool, salt: &Option<Salt>) -> Key {

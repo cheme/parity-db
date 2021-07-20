@@ -684,8 +684,9 @@ impl Db {
 			flush_worker_db.store_err(Self::flush_worker(flush_worker_db.clone()))
 		);
 		let log_worker_db = db.clone();
+		let skip_commit_queue = options.skip_commit_queue;
 		let log_thread = std::thread::spawn(move ||
-			log_worker_db.store_err(Self::log_worker(log_worker_db.clone()))
+			log_worker_db.store_err(Self::log_worker(log_worker_db.clone(), skip_commit_queue))
 		);
 		Ok(Db {
 			inner: db,
@@ -740,7 +741,7 @@ impl Db {
 		Ok(())
 	}
 
-	fn log_worker(db: Arc<DbInner>) -> Result<()> {
+	fn log_worker(db: Arc<DbInner>, skip_queue: bool) -> Result<()> {
 		// Start with pending reindex.
 		let mut more_work = db.process_reindex()?;
 		while !db.shutdown.load(Ordering::SeqCst) || more_work {
@@ -752,7 +753,7 @@ impl Db {
 				*work = false;
 			}
 
-			let more_commits = db.process_commits(false)?;
+			let more_commits = db.process_commits(skip_queue)?;
 			let more_reindex = db.process_reindex()?;
 			more_work = more_commits || more_reindex;
 		}
@@ -784,8 +785,15 @@ impl Db {
 	}
 
 	#[cfg(test)]
-	pub(crate) fn clone_table_id_manager(&self, col_id: ColId, size_tier: u8) -> Option<crate::no_indexing::TableIdManager> {
+	pub(crate) fn clone_check_table_id_manager(&self, col_id: ColId, size_tier: u8, do_check: bool) -> Option<crate::no_indexing::TableIdManager> {
 		self.inner.free_table_id_manager.read().clone_table_id_manager(col_id, size_tier)
+			.and_then(|ids| {
+				if do_check {
+					self.inner.columns[col_id as usize].check_free_list(size_tier, &ids, &self.inner.log.overlays).then(|| ids)
+				} else {
+					Some(ids)
+				}
+			})
 	}
 
 }

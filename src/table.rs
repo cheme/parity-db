@@ -875,11 +875,15 @@ impl ValueTable {
 			}
 			self.filled.store(index + 1, Ordering::Relaxed);
 			self.last_removed.store(l, Ordering::Relaxed);
+			self.dirty_header.store(true, Ordering::Relaxed);
 			return Ok(())
 		}
 		let next = self.read_next_free(index, log)?;
-		if prev == 0 {
+		let last_removed = self.last_removed.load(Ordering::Relaxed);
+		debug_assert!(prev != 0);
+		if prev == last_removed {
 			self.last_removed.store(next, Ordering::Relaxed);
+			self.dirty_header.store(true, Ordering::Relaxed);
 		} else {
 			let mut buf = PartialEntry::new();
 			buf.write_tombstone();
@@ -975,6 +979,9 @@ impl ValueTable {
 					&buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].copy_from_slice(&last_removed.to_le_bytes());
 					log.insert_value(self.id, no_indexing_tail, buf.to_vec());
 					last_removed = no_indexing_head;
+					self.last_removed.store(no_indexing_head, Ordering::Relaxed);
+					self.no_indexing_tail.store(0, Ordering::Relaxed);
+					self.no_indexing_head.store(0, Ordering::Relaxed);
 				}
 			}
 			buf.set_last_removed(last_removed);
@@ -996,6 +1003,54 @@ impl ValueTable {
 			self.filled.load(std::sync::atomic::Ordering::Relaxed),
 			self.last_removed.load(std::sync::atomic::Ordering::Relaxed),
 		)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn check_free_list(&self, ids: &crate::no_indexing::TableIdManager, log: &impl LogQuery) -> bool {
+		let filled = self.filled.load(std::sync::atomic::Ordering::Relaxed);
+		let last = self.last_removed.load(std::sync::atomic::Ordering::Relaxed); // TODO from db
+		let mut header = Header::default();
+		if log.value(self.id, 0, &mut header.0) {
+		} else {
+			self.read_at(&mut header.0, 0).unwrap();
+		};
+		let mut last = header.last_removed();
+		let filled = header.filled();
+		if filled != ids.filled {
+			return false;
+		}
+	
+		for (index, state) in ids.free_list.iter() {
+			let mut buf = PartialEntry::new();
+			let buf = if log.value(self.id, *index, &mut buf.1) {
+				&mut buf
+			} else {
+				self.read_at(&mut buf.1[..], index * self.entry_size as u64).unwrap();
+				&mut buf
+			};
+
+			match state {
+				crate::no_indexing::HandleState::Used(_)
+				| crate::no_indexing::HandleState::Free => {
+					if index != &last {
+						return false;
+					}
+
+					if !buf.is_tombstone() && index != &0 {
+						return false;
+					}
+					buf.skip_size();
+					last = buf.read_next();
+				},
+				crate::no_indexing::HandleState::Consumed => {
+					if buf.is_tombstone() {
+						return false;
+					}
+				},
+			}
+		}
+
+		true
 	}
 }
 

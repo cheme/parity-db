@@ -34,6 +34,8 @@ pub struct Options {
 	pub sync: bool,
 	/// Collect database statistics. May have effect on performance.
 	pub stats: bool,
+	/// For tests skip queueing commits before writing logs.
+	pub skip_commit_queue: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +126,7 @@ impl Options {
 			sync: true,
 			stats: true,
 			columns: (0..num_columns).map(|_| Default::default()).collect(),
+			skip_commit_queue: false,
 		}
 	}
 
