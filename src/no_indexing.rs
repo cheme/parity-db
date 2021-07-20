@@ -364,7 +364,7 @@ impl Lock {
 struct ColIdManager {
 	col_id: ColId,
 	locked: Arc<(Mutex<Lock>, Condvar)>,
-	current_handles: BTreeMap<HandleId, Vec<FetchedIds>>,
+	current_handles: BTreeMap<HandleId, ()>,
 	free_handles: Vec<HandleId>,
 	tables: Vec<TableIdManager>,
 }
@@ -430,7 +430,8 @@ impl ColIdManager {
 				0
 			}
 		};
-		self.current_handles.insert(id, Default::default());
+		self.current_handles.insert(id, ());
+		//self.current_handles.insert(id, vec![Default::default(); crate::table::SIZE_TIERS]);
 		id
 	}
 	fn commit_entry<K>(
@@ -462,11 +463,16 @@ impl ColIdManager {
 
 	fn dropped_handle(&mut self, handle_id: HandleId) {
 		if let Some(fetched_ids) = self.current_handles.remove(&handle_id) {
-			for (table_ix, fetched_id) in fetched_ids.into_iter().enumerate() {
+			for table_ix in  0 .. crate::table::SIZE_TIERS {
+				// TODO can target more precisely by adding fetched size tier
+				// or even the fetched ids.
+				self.tables[table_ix].dropped_handle(handle_id);
+			}
+/*			for (table_ix, fetched_id) in fetched_ids.into_iter().enumerate() {
 				if fetched_id.len() > 0 {
 					self.tables[table_ix].dropped_handle(handle_id, fetched_id);
 				}
-			}
+			}*/
 			// reuse handle
 			self.free_handles.push(handle_id);
 		}
@@ -524,9 +530,22 @@ impl TableIdManager {
 		None
 	}
 	fn removed_index(&mut self, address: Address) {
-		self.free_list.push_front((address.offset(), HandleState::Free));
+		let offset = address.offset();
+		// remove if in free_list TODO double index??
+		if let Some(pos) = self.free_list.iter().position(|(a, _)| a == &offset) {
+			self.free_list.remove(pos);
+		}
+		self.free_list.push_front((offset, HandleState::Free));
 	}
-	fn dropped_handle(&mut self, handle_id: HandleId, fetched_ids: Vec<usize>) {
+	//fn dropped_handle(&mut self, handle_id: HandleId, fetched_ids: Vec<usize>) {
+	fn dropped_handle(&mut self, handle_id: HandleId) {
+		// TODO can have something faster
+		for (_, state) in self.free_list.iter_mut() {
+			if state == &HandleState::Used(handle_id) {
+				*state = HandleState::Free;
+			}
+		}
+		/*
 		for ix in fetched_ids.into_iter().rev() {
 			debug_assert!(&self.free_list[ix].1 != &HandleState::Free);
 			if let HandleState::Used(id) = &self.free_list[ix].1 {
@@ -542,6 +561,7 @@ impl TableIdManager {
 			// implemented as a maintenance method.
 			// -> would need to use offset to avoid updating all registered ix
 		}
+		*/
 		/*
 		while self.free_list.front().map(|f| f.1 == handle_id).unwrap_or(false) {
 			let _ = self.free_list.pop_front();
@@ -792,6 +812,7 @@ mod tests {
 		check_state(&db, &state);
 
 		let handle = prepare_add(&db, None, &mut state, &mut writer, (6, 10));
+		// 5 and 10
 		let handle = prepare_remove(&db, Some(handle), &mut state, &mut writer, (4, 7));
 
 		commit_with_handle(&db, handle, &mut writer);
@@ -800,7 +821,7 @@ mod tests {
 		wait_log();
 		check_state(&db, &state);
 
-		let handle = prepare_add(&db, None, &mut state, &mut writer, (11, 12));
+		let handle = prepare_add(&db, None, &mut state, &mut writer, (11, 13));
 
 		commit_with_handle(&db, handle, &mut writer);
 
