@@ -812,7 +812,7 @@ impl DbHandle {
 		self.inner.columns[col_id as usize].read_next_free_no_indexing(table_ix, free, &*self.inner.log.overlays)
 	}
 
-	pub(crate) fn fetch_free_id(&self, handle_id: crate::no_indexing::HandleId, col: ColId, size_tier: u8) -> u64 {
+	pub(crate) fn fetch_free_id(&self, handle_id: crate::no_indexing::HandleId, col: ColId, size_tier: u8) -> crate::index::Address {
 		self.inner.free_table_id_manager.write().fetch_free_id(handle_id, col, size_tier)
 	}
 

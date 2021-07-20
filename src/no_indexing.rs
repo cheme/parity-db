@@ -148,9 +148,9 @@ impl FreeIdHandle {
 			}
 			let filled = filled.as_mut().unwrap();
 			*filled += 1;
-			return *filled - 1;
+			return Address::new(*filled - 1, size_tier).as_u64();
 		}
-		self.db.fetch_free_id(self.id, self.col, size_tier)
+		self.db.fetch_free_id(self.id, self.col, size_tier).as_u64()
 	}
 
 	/// Collection for this handle.
@@ -448,7 +448,6 @@ impl ColIdManager {
 	) {
 		let address = Address::from_be_slice(&key.as_ref()[0..8]);
 		let size_tier = address.size_tier();
-		let address = address.as_u64();
 		self.tables[size_tier as usize].removed_index(address);
 	}
 
@@ -481,7 +480,7 @@ impl TableIdManager {
 		for free in self.free_list.iter_mut() {
 			if from.is_none() {
 				if let HandleState::Used(id) = &free.1 {
-					if free.0 == address.as_u64() {
+					if free.0 == address.offset() {
 						debug_assert!(id == &handle);
 						from = Some(free.0);
 						free.1 = HandleState::Consumed;
@@ -515,8 +514,8 @@ impl TableIdManager {
 		debug_assert!(false);
 		None
 	}
-	fn removed_index(&mut self, address: u64) {
-		self.free_list.push_front((address, HandleState::Free));
+	fn removed_index(&mut self, address: Address) {
+		self.free_list.push_front((address.offset(), HandleState::Free));
 	}
 	fn dropped_handle(&mut self, handle_id: HandleId, fetched_ids: Vec<usize>) {
 		for ix in fetched_ids.into_iter().rev() {
@@ -631,15 +630,16 @@ impl IdManager {
 		}
 	}
 
-	pub(crate) fn fetch_free_id(&mut self, handle_id: crate::no_indexing::HandleId, col: ColId, size_tier: u8) -> u64 {
+	pub(crate) fn fetch_free_id(&mut self, handle_id: crate::no_indexing::HandleId, col: ColId, size_tier: u8) -> Address {
 		if let Some(Some(column)) = self.columns.get_mut(col as usize) {
 			if let Some(table) = column.tables.get_mut(size_tier as usize) {
-				table.fetch_free_id(handle_id, &self.db.as_ref().unwrap(), col, size_tier)
+				let offset = table.fetch_free_id(handle_id, &self.db.as_ref().unwrap(), col, size_tier);
+				Address::new(offset, size_tier)
 			} else {
-				0
+				Address::from_u64(0)
 			}
 		} else {
-			0
+			Address::from_u64(0)
 		}
 	}
 }

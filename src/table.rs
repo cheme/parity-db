@@ -731,6 +731,8 @@ impl ValueTable {
 	}
 
 	fn clear_slot(&self, index: u64, log: &mut LogWriter) -> Result<()> {
+		// TODO for non_indexed: manage another last_removed ptr to prepend it only at
+		// the very end.
 		let last_removed = self.last_removed.load(Ordering::Relaxed);
 		log::trace!(
 			target: "parity-db",
@@ -840,7 +842,8 @@ impl ValueTable {
 	}
 
 	pub fn write_inner_free_list_remove(&self, index: u64, next: u64, log: &mut LogWriter) -> Result<()> {
-		let prev = self.read_next_free(index, log)?;
+		let prev = self.read_next_free(index, log)?; // TODO if > filled next is index + update filled
+		// TODO if next is 0 do not change entry, just change last_removed ptr to index next
 		let mut buf = PartialEntry::new();
 		buf.write_tombstone();
 		buf.write_next(prev);
