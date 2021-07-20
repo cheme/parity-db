@@ -648,6 +648,7 @@ impl IdManager {
 mod tests {
 	use crate::options::{Options, ColumnOptions};
 	use std::collections::BTreeMap;
+	use super::{FreeIdHandle};
 
 	fn options(name: &str) -> Options {
 		env_logger::try_init().ok();
@@ -670,31 +671,81 @@ mod tests {
 	}
 
 
+	fn prepare_add(
+		db: &crate::Db,
+		handle: Option<FreeIdHandle>,
+		state: &mut BTreeMap<u8, (u64, Option<Vec<u8>>)>,
+		writer: &mut BTreeMap<u64, Option<Vec<u8>>>,
+		range: (u8, u8),
+	) -> FreeIdHandle {
+		let mut handle = handle.unwrap_or_else(|| db.get_handle(0, false).unwrap());
+		handle.ready();
+		for i in range.0 .. range.1 {
+			let mut value = b"test_value".to_vec();
+			value.push(i);
+			let id = handle.fetch_free_id(value.len());
+			state.insert(i, (id, Some(value.clone())));
+			writer.insert(id, Some(value));
+		}
+		handle
+	}
+
+	fn prepare_remove(
+		db: &crate::Db,
+		handle: Option<FreeIdHandle>,
+		state: &mut BTreeMap<u8, (u64, Option<Vec<u8>>)>,
+		writer: &mut BTreeMap<u64, Option<Vec<u8>>>,
+		range: (u8, u8),
+	) -> FreeIdHandle {
+		let mut handle = handle.unwrap_or_else(|| db.get_handle(0, false).unwrap());
+		handle.ready();
+		for i in range.0 .. range.1 {
+			if let Some(id) = state.remove(&i).map(|s| s.0) {
+				writer.insert(id, None);
+			}
+		}
+		handle
+	}
+
+	fn commit_with_handle(db: &crate::Db, handle: FreeIdHandle, writer: &mut BTreeMap<u64, Option<Vec<u8>>>) {
+		let mut handle_map = BTreeMap::new();
+		handle_map.insert(0, handle);
+		db.commit_with_non_canonical(writer.iter().map(|(id, v)| {
+			(0, id.to_be_bytes().to_vec(), v.clone()) 
+		}), handle_map);
+		writer.clear();
+	}
+
+	fn check_state(
+		db: &crate::Db,
+		state: &BTreeMap<u8, (u64, Option<Vec<u8>>)>,
+	) {
+		for (_, (id, val)) in state.iter() {
+			assert_eq!(val, &db.get(0, &id.to_be_bytes()[..]).unwrap());
+		}
+	}
+
+	fn wait_log() {
+		use std::{thread, time};
+
+		let sleep = time::Duration::from_millis(100);
+		thread::sleep(sleep);
+	}
+	
 	#[test]
 	fn test_no_locks() {
 		let options = options("test_no_lock");
 		let db = crate::Db::open(&options).unwrap();
+		let mut state = BTreeMap::<u8, (u64, Option<Vec<u8>>)>::new();
 		let mut writer = BTreeMap::<u64, Option<Vec<u8>>>::new();
-		{
-			let mut handle = db.get_handle(0, false).unwrap();
-			handle.ready();
-			for i in 0u8..5 {
-				let mut value = b"test_value".to_vec();
-				value.push(i);
-				writer.insert(handle.fetch_free_id(value.len()), Some(value));
-			}
-			let mut handle_map = BTreeMap::new();
-			handle_map.insert(0, handle);
-			db.commit_with_non_canonical(writer.iter().map(|(id, v)| {
-				(0, id.to_be_bytes().to_vec(), v.clone()) 
-			}), handle_map);
-		}
+		let handle = prepare_add(&db, None, &mut state, &mut writer, (0, 5));
+		commit_with_handle(&db, handle, &mut writer);
 
-		use std::{thread, time};
+		check_state(&db, &state);
 
-		let sleep = time::Duration::from_millis(100);
-
-		thread::sleep(sleep);
+		wait_log();
+		
+		check_state(&db, &state);
 	}
 
 	#[test]

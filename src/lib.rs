@@ -32,7 +32,7 @@ pub use options::{ColumnOptions, Options};
 
 const KEY_LEN: usize = 32;
 
-#[derive(PartialEq, Eq, Clone)]
+#[derive(Eq, Clone)]
 // TODO traitify enum?
 pub enum Key { // TODO remove pub??
 	Hash([u8; KEY_LEN]),
@@ -41,6 +41,22 @@ pub enum Key { // TODO remove pub??
 	WithKey(u64, Vec<u8>),
 	// TODO consider withkeyref(u64, &'a[u8])
 	NoIndexing(u64, Option<u64>),
+}
+
+impl std::cmp::PartialEq<Self> for Key {
+	fn eq(&self, other: &Self) -> bool {
+		match (self, other) {
+			(Key::Hash(hash1), Key::Hash(hash2)) => hash1.eq(hash2),
+			(Key::WithKey(hash1, full1), Key::WithKey(hash2, full2)) => {
+				hash1.eq(hash2) && full1.eq(full2)
+			},
+			(Key::NoIndexing(hash1, _), Key::NoIndexing(hash2, _)) => {
+				// do not compare prev to be able to query overlay
+				hash1.eq(hash2)
+			},
+			_ => false,
+		}
+	}
 }
 
 impl std::hash::Hash for Key {
@@ -89,7 +105,7 @@ impl Key {
 		match self {
 			Key::Hash(hash) => &hash[6..],
 			Key::WithKey(_hash, full) => &full[..],
-			Key::NoIndexing(_hash, _next_free) => unreachable!("No key in no indexing"),
+			Key::NoIndexing(_hash, _next_free) => &[],
 		}
 	}
 
