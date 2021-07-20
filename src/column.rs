@@ -347,7 +347,9 @@ impl Column {
 				debug_assert!(next_free.size_tier() == tier);
 				// overwrite a value of free_list
 				log::trace!(target: "parity-db", "{}: NoIndexing remove from free list {}", tables.index.id, hex(key));
-				tables.value[tier as usize].write_inner_free_list_remove(address.offset(), next_free.offset(), log)?;
+				if value.is_some() {
+					tables.value[tier as usize].write_inner_free_list_remove(address.offset(), next_free.offset(), log)?;
+				}
 				no_indexing_new = true;
 			}
 			Some((&tables.index, 0, tier, address))
@@ -391,7 +393,7 @@ impl Column {
 					return Ok(PlanOutcome::Written);
 				} else {
 					log::trace!(target: "parity-db", "{}: Replacing in a new table {}", tables.index.id, hex(key));
-					tables.value[existing_tier].write_remove_plan(existing_address.offset(), log)?;
+					tables.value[existing_tier].write_remove_plan(existing_address.offset(), log, no_indexing_new)?;
 					let new_offset = tables.value[target_tier].write_insert_plan(key, &cval, log, compressed)?;
 					let new_address = Address::new(new_offset, target_tier as u8);
 					// If it was found in an older index we just insert a new entry. Reindex won't overwrite it.
@@ -443,7 +445,7 @@ impl Column {
 					removed
 				} else {
 					log::trace!(target: "parity-db", "{}: Deleting {}", table.id, hex(key));
-					tables.value[existing_tier].write_remove_plan(existing_address.offset(), log)?;
+					tables.value[existing_tier].write_remove_plan(existing_address.offset(), log, no_indexing_new)?;
 					true
 				};
 				if remove {

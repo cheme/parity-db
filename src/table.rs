@@ -727,19 +727,30 @@ impl ValueTable {
 		loop {
 			match self.read_next_part(index, log)? {
 				Some(next) => {
-					self.clear_slot(index, log)?;
+					self.clear_slot(index, log, false)?;
 					index = next;
 				}
 				None => {
-					self.clear_slot(index, log)?;
+					self.clear_slot(index, log, false)?;
 					return Ok(());
 				}
 			}
 		}
 	}
 
-	fn clear_slot(&self, index: u64, log: &mut LogWriter) -> Result<()> {
+	fn clear_slot(&self, index: u64, log: &mut LogWriter, no_indexing_new: bool) -> Result<()> {
 		if self.no_indexing {
+			if no_indexing_new {
+				// check if previously added, otherwhise just noop.
+				let mut buf = PartialEntry::new();
+				if log.value(self.id, index, &mut buf.1) {
+					if buf.is_tombstone() {
+						return Ok(());
+					}
+				} else {
+					return Ok(());
+				}
+			}
 			// free in temorary list.
 			let last_removed = self.no_indexing_head.load(Ordering::Relaxed);
 			let tail = self.no_indexing_tail.load(Ordering::Relaxed);
@@ -747,10 +758,12 @@ impl ValueTable {
 				self.no_indexing_tail.store(index, Ordering::Relaxed);
 			}
 			self.no_indexing_head.store(index, Ordering::Relaxed);
-			let mut buf = [0u8; 10];
-			&buf[0..SIZE_SIZE].copy_from_slice(TOMBSTONE);
-			&buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].copy_from_slice(&last_removed.to_le_bytes());
-			log.insert_value(self.id, index, buf.to_vec());
+			if tail != 0 {
+				let mut buf = [0u8; 10];
+				&buf[0..SIZE_SIZE].copy_from_slice(TOMBSTONE);
+				&buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].copy_from_slice(&last_removed.to_le_bytes());
+				log.insert_value(self.id, index, buf.to_vec());
+			}
 			self.dirty_header.store(true, Ordering::Relaxed);
 			return Ok(());
 		}
@@ -780,11 +793,11 @@ impl ValueTable {
 		Ok(())
 	}
 
-	pub fn write_remove_plan(&self, index: u64, log: &mut LogWriter) -> Result<()> {
+	pub fn write_remove_plan(&self, index: u64, log: &mut LogWriter, new_no_indexing: bool) -> Result<()> {
 		if self.multipart {
 			self.clear_chain(index, log)?;
 		} else {
-			self.clear_slot(index, log)?;
+			self.clear_slot(index, log, new_no_indexing)?;
 		}
 		Ok(())
 	}
@@ -798,7 +811,7 @@ impl ValueTable {
 		if self.change_ref(index, -1, log, None)? {
 			return Ok(true);
 		}
-		self.write_remove_plan(index, log)?;
+		self.write_remove_plan(index, log, false)?;
 		Ok(false)
 	}
 
@@ -880,8 +893,8 @@ impl ValueTable {
 		}
 		let next = self.read_next_free(index, log)?;
 		let last_removed = self.last_removed.load(Ordering::Relaxed);
-		debug_assert!(prev != 0);
-		if prev == last_removed {
+		if prev == 0 {
+//			if prev == last_removed || prev == 0 {
 			self.last_removed.store(next, Ordering::Relaxed);
 			self.dirty_header.store(true, Ordering::Relaxed);
 		} else {
@@ -1205,7 +1218,7 @@ mod test {
 		});
 
 		write_ops(&table, &log, |writer| {
-			table.write_remove_plan(1, writer).unwrap();
+			table.write_remove_plan(1, writer, false).unwrap();
 		});
 
 		assert_eq!(table.get(&key1, 1, log.overlays()).unwrap(), None);

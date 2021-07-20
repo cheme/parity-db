@@ -257,11 +257,18 @@ impl IdManager {
 	pub(crate) fn removed_index(
 		&mut self,
 		col: ColId,
-		key: &[u8],
-	) {
+		key: impl AsRef<[u8]>,
+	) -> impl AsRef<[u8]> {
 		if let Some(col) = self.columns[col as usize].as_mut() {
-			return col.removed_index(key);
+			if col.removed_index(key.as_ref()) {
+				let mut buf = [0; 16];
+				buf[0..8].copy_from_slice(&key.as_ref()[..]);
+				// Just to indicate remove of a new value.
+				buf[8..16].copy_from_slice(&0u64.to_be_bytes()[..]);
+				return ExtendedKey::U64BEOnFree(buf);
+			}
 		}
+		ExtendedKey::Full(key)
 	}
 	// To be called after data is commited and handle has been drop to update state.
 	pub(crate) fn commit(&mut self) {
@@ -455,10 +462,10 @@ impl ColIdManager {
 	pub(crate) fn removed_index(
 		&mut self,
 		key: &[u8],
-	) {
+	) -> bool {
 		let address = Address::from_be_slice(&key.as_ref()[0..8]);
 		let size_tier = address.size_tier();
-		self.tables[size_tier as usize].removed_index(address);
+		self.tables[size_tier as usize].removed_index(address)
 	}
 
 	fn dropped_handle(&mut self, handle_id: HandleId) {
@@ -492,7 +499,7 @@ impl TableIdManager {
 		// radix-tree later?? (but changed dropped_handle a bit).
 		let mut from = None;
 		let mut to = None;
-		for free in self.free_list.iter_mut() {
+		for free in self.free_list.iter_mut().rev() {
 			if from.is_none() {
 				if let HandleState::Used(id) = &free.1 {
 					if free.0 == address.offset() {
@@ -518,26 +525,34 @@ impl TableIdManager {
 			}
 		}
 		match (from, to) {
-			(Some(from), Some(to)) => {
+			(Some(from), to) => {
+				let to = to.map(|to| to.as_u64()).unwrap_or(0);
 				let mut buf = [0; 16];
 				buf[0..8].copy_from_slice(&from.as_u64().to_be_bytes()[..]);
-				buf[8..16].copy_from_slice(&to.as_u64().to_be_bytes()[..]);
+				buf[8..16].copy_from_slice(&to.to_be_bytes()[..]);
 				return Some(ExtendedKey::U64BEOnFree(buf));
 			},
-			(None, Some(_))
-			| (Some(_), None) => unreachable!("See free list construction"),
+			(None, Some(_)) => unreachable!("See free list construction"),
 			_ => (),
 		}
 		debug_assert!(false);
 		None
 	}
-	fn removed_index(&mut self, address: Address) {
+	fn removed_index(&mut self, address: Address) -> bool {
+		let mut is_new = false;
 		let offset = address.offset();
 		// remove if in free_list TODO double index??
 		if let Some(pos) = self.free_list.iter().position(|(a, _)| a == &offset) {
-			self.free_list.remove(pos);
+			if let Some(handle) = self.free_list.remove(pos) {
+				is_new = match handle.1 {
+					HandleState::Free
+					| HandleState::Used(_) => true,
+					HandleState::Consumed => false,
+				}
+			}
 		}
 		self.free_list.push_front((offset, HandleState::Free));
+		is_new
 	}
 	//fn dropped_handle(&mut self, handle_id: HandleId, fetched_ids: Vec<usize>) {
 	fn dropped_handle(&mut self, handle_id: HandleId) {
@@ -827,9 +842,7 @@ mod tests {
 		check_state(&db, &state);
 
 		for i in 0..3 { wait_log() };
-		let free_list = db.clone_check_table_id_manager(0, 0, true).unwrap();
-		panic!("{:?}", free_list);
-
+		let _ = db.clone_check_table_id_manager(0, 0, true).unwrap();
 
 		let handle = prepare_add(&db, None, &mut state, &mut writer, (11, 13));
 
@@ -841,7 +854,7 @@ mod tests {
 
 		for i in 0..3 { wait_log() };
 		let free_list = db.clone_check_table_id_manager(0, 0, true).unwrap();
-		panic!("{:?}", free_list);
+		println!("{:?}", free_list);
 	}
 
 	#[test]

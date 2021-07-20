@@ -241,7 +241,7 @@ impl DbInner {
 					let k = non_canonical_overlay.commit_entry(c, k, handle.id);
 					(c, self.columns[c as usize].hash(k.as_ref()), v)
 				} else {
-					non_canonical_overlay.removed_index(c, k.as_ref());
+					let k = non_canonical_overlay.removed_index(c, k.as_ref());
 					(c, self.columns[c as usize].hash(k.as_ref()), v)
 				}
 			} else {
