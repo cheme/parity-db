@@ -482,7 +482,7 @@ impl TableIdManager {
 				if let HandleState::Used(id) = &free.1 {
 					if free.0 == address.offset() {
 						debug_assert!(id == &handle);
-						from = Some(free.0);
+						from = Some(Address::new(free.0, self.size_tier));
 						free.1 = HandleState::Consumed;
 					}
 				}
@@ -492,10 +492,10 @@ impl TableIdManager {
 					HandleState::Used(_id) => {
 						// Note that if keys where resolved ordered we could
 						// skip when id is equal to handle and just write with from.
-						to = Some(free.0);
+						to = Some(Address::new(free.0, self.size_tier));
 					},
 					HandleState::Free => {
-						to = Some(free.0);
+						to = Some(Address::new(free.0, self.size_tier));
 					},
 				}
 			}
@@ -503,8 +503,8 @@ impl TableIdManager {
 		match (from, to) {
 			(Some(from), Some(to)) => {
 				let mut buf = [0; 16];
-				buf[0..8].copy_from_slice(&from.to_be_bytes()[..]);
-				buf[8..16].copy_from_slice(&to.to_be_bytes()[..]);
+				buf[0..8].copy_from_slice(&from.as_u64().to_be_bytes()[..]);
+				buf[8..16].copy_from_slice(&to.as_u64().to_be_bytes()[..]);
 				return Some(ExtendedKey::U64BEOnFree(buf));
 			},
 			(None, Some(_))
@@ -689,6 +689,12 @@ mod tests {
 				(0, id.to_be_bytes().to_vec(), v.clone()) 
 			}), handle_map);
 		}
+
+		use std::{thread, time};
+
+		let sleep = time::Duration::from_millis(100);
+
+		thread::sleep(sleep);
 	}
 
 	#[test]

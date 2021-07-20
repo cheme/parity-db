@@ -338,13 +338,17 @@ impl Column {
 		//TODO: return sub-chunk position in index.get
 		let tables = self.tables.upgradable_read();
 		let reindex = self.reindex.upgradable_read();
+		let mut no_indexing_new = false;
 		let existing = if let Key::NoIndexing(address, next_free) = key {
 			let address = Address::from_u64(*address);
 			let tier = address.size_tier();
 			if let Some(next_free) = next_free {
+				let next_free = Address::from_u64(*next_free);
+				debug_assert!(next_free.size_tier() == tier);
 				// overwrite a value of free_list
 				log::trace!(target: "parity-db", "{}: NoIndexing remove from free list {}", tables.index.id, hex(key));
-				tables.value[tier as usize].write_inner_free_list_remove(address.as_u64(), *next_free, log)?;
+				tables.value[tier as usize].write_inner_free_list_remove(address.offset(), next_free.offset(), log)?;
+				no_indexing_new = true;
 			}
 			Some((&tables.index, 0, tier, address))
 		} else {
@@ -383,7 +387,7 @@ impl Column {
 				}
 				if existing_tier == target_tier {
 					log::trace!(target: "parity-db", "{}: Replacing {}", tables.index.id, hex(key));
-					tables.value[target_tier].write_replace_plan(existing_address.offset(), key, &cval, log, compressed)?;
+					tables.value[target_tier].write_replace_plan(existing_address.offset(), key, &cval, log, compressed, no_indexing_new)?;
 					return Ok(PlanOutcome::Written);
 				} else {
 					log::trace!(target: "parity-db", "{}: Replacing in a new table {}", tables.index.id, hex(key));

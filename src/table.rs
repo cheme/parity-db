@@ -128,6 +128,8 @@ pub struct ValueTable {
 	filled: AtomicU64,
 	last_removed: AtomicU64,
 	dirty_header: AtomicBool,
+	no_indexing_tail: AtomicU64,
+	no_indexing_head: AtomicU64,
 	dirty: AtomicBool,
 	multipart: bool,
 	attach_key: bool,
@@ -304,6 +306,8 @@ impl ValueTable {
 			multipart,
 			attach_key: options.attach_key,
 			no_indexing: options.no_indexing,
+			no_indexing_tail: AtomicU64::new(0),
+			no_indexing_head: AtomicU64::new(0),
 		})
 	}
 
@@ -605,7 +609,7 @@ impl ValueTable {
 		Ok(index)
 	}
 
-	fn overwrite_chain(&self, key: &Key, value: &[u8], log: &mut LogWriter, at: Option<u64>, compressed: bool) -> Result<u64> {
+	fn overwrite_chain(&self, key: &Key, value: &[u8], log: &mut LogWriter, at: Option<u64>, compressed: bool, no_indexing_new: bool) -> Result<u64> {
 		let encoded_key_len = key.encoded_len();
 		let mut key_remaining = encoded_key_len;
 		let mut remainder = value.len() + REFS_SIZE + if self.attach_key {
@@ -629,7 +633,9 @@ impl ValueTable {
 			}
 
 			let mut next_index = 0;
-			if follow {
+			if no_indexing_new {
+				follow = false;
+			} else if follow {
 				// check existing link
 				match self.read_next_part(index, log)? {
 					Some(next) => {
@@ -650,6 +656,8 @@ impl ValueTable {
 			let mut buf = FullEntry::new();
 			let free_space = self.entry_size as usize - SIZE_SIZE;
 			let (target_offset, value_len) = if remainder > free_space {
+				// Currently we cannot get next index, free index list being locked.,
+				assert!(!self.no_indexing);
 				if !follow {
 					next_index = self.next_free(log)?
 				}
@@ -731,8 +739,21 @@ impl ValueTable {
 	}
 
 	fn clear_slot(&self, index: u64, log: &mut LogWriter) -> Result<()> {
-		// TODO for non_indexed: manage another last_removed ptr to prepend it only at
-		// the very end.
+		if self.no_indexing {
+			// free in temorary list.
+			let last_removed = self.no_indexing_head.load(Ordering::Relaxed);
+			let tail = self.no_indexing_tail.load(Ordering::Relaxed);
+			if tail == 0 {
+				self.no_indexing_tail.store(index, Ordering::Relaxed);
+			}
+			self.no_indexing_head.store(index, Ordering::Relaxed);
+			let mut buf = [0u8; 10];
+			&buf[0..SIZE_SIZE].copy_from_slice(TOMBSTONE);
+			&buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].copy_from_slice(&last_removed.to_le_bytes());
+			log.insert_value(self.id, index, buf.to_vec());
+			self.dirty_header.store(true, Ordering::Relaxed);
+			return Ok(());
+		}
 		let last_removed = self.last_removed.load(Ordering::Relaxed);
 		log::trace!(
 			target: "parity-db",
@@ -751,11 +772,11 @@ impl ValueTable {
 	}
 
 	pub fn write_insert_plan(&self, key: &Key, value: &[u8], log: &mut LogWriter, compressed: bool) -> Result<u64> {
-		self.overwrite_chain(key, value, log, None, compressed)
+		self.overwrite_chain(key, value, log, None, compressed, false)
 	}
 
-	pub fn write_replace_plan(&self, index: u64, key: &Key, value: &[u8], log: &mut LogWriter, compressed: bool) -> Result<()> {
-		self.overwrite_chain(key, value, log, Some(index), compressed)?;
+	pub fn write_replace_plan(&self, index: u64, key: &Key, value: &[u8], log: &mut LogWriter, compressed: bool, no_indexing_new: bool) -> Result<()> {
+		self.overwrite_chain(key, value, log, Some(index), compressed, no_indexing_new)?;
 		Ok(())
 	}
 
@@ -841,13 +862,30 @@ impl ValueTable {
 		return Ok(true);
 	}
 
-	pub fn write_inner_free_list_remove(&self, index: u64, next: u64, log: &mut LogWriter) -> Result<()> {
-		let prev = self.read_next_free(index, log)?; // TODO if > filled next is index + update filled
-		// TODO if next is 0 do not change entry, just change last_removed ptr to index next
-		let mut buf = PartialEntry::new();
-		buf.write_tombstone();
-		buf.write_next(prev);
-		log.insert_value(self.id, next, buf.1.as_ref().to_vec());
+	pub fn write_inner_free_list_remove(&self, index: u64, prev: u64, log: &mut LogWriter) -> Result<()> {
+		let filled = self.filled.load(Ordering::Relaxed);
+		if index >= filled {
+			let mut l = self.last_removed.load(Ordering::Relaxed);
+			for i in filled..index {
+				let mut buf = PartialEntry::new();
+				buf.write_tombstone();
+				buf.write_next(l);
+				log.insert_value(self.id, i, buf.1.as_ref().to_vec());
+				l = i;
+			}
+			self.filled.store(index + 1, Ordering::Relaxed);
+			self.last_removed.store(l, Ordering::Relaxed);
+			return Ok(())
+		}
+		let next = self.read_next_free(index, log)?;
+		if prev == 0 {
+			self.last_removed.store(next, Ordering::Relaxed);
+		} else {
+			let mut buf = PartialEntry::new();
+			buf.write_tombstone();
+			buf.write_next(next);
+			log.insert_value(self.id, prev, buf.1.as_ref().to_vec());
+		}
 		Ok(())
 	}
 
@@ -925,8 +963,20 @@ impl ValueTable {
 		if let Ok(true) = self.dirty_header.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed) {
 			// last_removed or filled pointers were modified. Add them to the log
 			let mut buf = Header::default();
-			let last_removed = self.last_removed.load(Ordering::Relaxed);
+			let mut last_removed = self.last_removed.load(Ordering::Relaxed);
 			let filled = self.filled.load(Ordering::Relaxed);
+			if self.no_indexing {
+				let no_indexing_tail = self.no_indexing_tail.load(Ordering::Relaxed);
+				let no_indexing_head = self.no_indexing_head.load(Ordering::Relaxed);
+				if no_indexing_tail != 0 {
+					// rattach removed value to head
+					let mut buf = [0u8; 10];
+					&buf[0..SIZE_SIZE].copy_from_slice(TOMBSTONE);
+					&buf[SIZE_SIZE..SIZE_SIZE + INDEX_SIZE].copy_from_slice(&last_removed.to_le_bytes());
+					log.insert_value(self.id, no_indexing_tail, buf.to_vec());
+					last_removed = no_indexing_head;
+				}
+			}
 			buf.set_last_removed(last_removed);
 			buf.set_filled(filled);
 			log.insert_value(self.id, 0, buf.0.to_vec());
@@ -1138,7 +1188,7 @@ mod test {
 		});
 
 		write_ops(&table, &log, |writer| {
-			table.write_replace_plan(1, &key3, &val3, writer, false).unwrap();
+			table.write_replace_plan(1, &key3, &val3, writer, false, false).unwrap();
 		});
 
 		assert_eq!(table.get(&key3, 1, log.overlays()).unwrap(), Some((val3, false)));
@@ -1173,7 +1223,7 @@ mod test {
 		assert_eq!(table.filled.load(std::sync::atomic::Ordering::Relaxed), 7);
 
 		write_ops(&table, &log, |writer| {
-			table.write_replace_plan(1, &key1, &val1s, writer, compressed).unwrap();
+			table.write_replace_plan(1, &key1, &val1s, writer, compressed, false).unwrap();
 		});
 		assert_eq!(table.get(&key1, 1, log.overlays()).unwrap(), Some((val1s, compressed)));
 		assert_eq!(table.last_removed.load(std::sync::atomic::Ordering::Relaxed), 5);
@@ -1212,7 +1262,7 @@ mod test {
 		assert_eq!(table.filled.load(std::sync::atomic::Ordering::Relaxed), 4);
 
 		write_ops(&table, &log, |writer| {
-			table.write_replace_plan(1, &key1, &val1l, writer, compressed).unwrap();
+			table.write_replace_plan(1, &key1, &val1l, writer, compressed, false).unwrap();
 		});
 		assert_eq!(table.get(&key1, 1, log.overlays()).unwrap(), Some((val1l, compressed)));
 		assert_eq!(table.last_removed.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -1244,7 +1294,7 @@ mod test {
 		assert_eq!(table.get(&key2, 6, log.overlays()).unwrap(), Some((val2.clone(), compressed)));
 
 		write_ops(&table, &log, |writer| {
-			table.write_replace_plan(1, &key1, &val2, writer, compressed).unwrap();
+			table.write_replace_plan(1, &key1, &val2, writer, compressed, false).unwrap();
 		});
 		assert_eq!(table.get(&key1, 1, log.overlays()).unwrap(), Some((val2, compressed)));
 	}
