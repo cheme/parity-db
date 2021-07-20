@@ -779,9 +779,15 @@ impl Db {
 	pub fn get_handle(&self, col_id: ColId, single_write: bool) -> Option<crate::no_indexing::FreeIdHandle> {
 		self.inner.free_table_id_manager.write().get_handle(col_id, single_write)
 	}
-	pub fn get_read_only_handle(&mut self, col_id: ColId, no_write: bool) -> Option<crate::no_indexing::FreeIdHandle> {
+	pub fn get_read_only_handle(&self, col_id: ColId, no_write: bool) -> Option<crate::no_indexing::FreeIdHandle> {
 		self.inner.free_table_id_manager.write().get_read_only_handle(col_id, no_write)
 	}
+
+	#[cfg(test)]
+	pub(crate) fn clone_table_id_manager(&self, col_id: ColId, size_tier: u8) -> Option<crate::no_indexing::TableIdManager> {
+		self.inner.free_table_id_manager.read().clone_table_id_manager(col_id, size_tier)
+	}
+
 }
 
 impl Drop for Db {

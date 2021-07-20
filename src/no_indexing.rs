@@ -175,7 +175,9 @@ impl FreeIdHandle {
 		self.db.dropped_handle(self.col, self.id);
 
 		let mut lock = self.locked.0.lock();
-		lock.release(self.id);
+		if lock.release(self.id) {
+			self.locked.1.notify_all();
+		}
 	}
 
 	/// Release fetched ids.
@@ -213,6 +215,12 @@ pub(crate) struct IdManager {
 }
 
 impl IdManager {
+
+	#[cfg(test)]
+	pub(crate) fn clone_table_id_manager(&self, col_id: ColId, size_tier: u8) -> Option<crate::no_indexing::TableIdManager> {
+		self.columns.get(col_id as usize).and_then(|col| col.as_ref().and_then(|col| col.tables.get(size_tier as usize).cloned()))
+	}
+
 	pub(crate) fn new(options: &crate::options::Options) -> Self {
 		let columns = options.columns.iter().enumerate()
 			.map(|(id, c)| c.no_indexing.then(|| ColIdManager::new(id as u8)))
@@ -377,15 +385,15 @@ impl ColIdManager {
 	}
 }
 
-#[derive(Default)]
-struct TableIdManager {
+#[derive(Default, Clone, Debug)] // TODO clone and debug test only
+pub(crate) struct TableIdManager {
 	size_tier: u8,
 	filled: u64,
 	// head is first
 	free_list: VecDeque<(u64, HandleState)>,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Clone, Debug)] // TODO clone and debug test only
 enum HandleState {
 	Free,
 	Used(HandleId),
@@ -401,6 +409,7 @@ impl ColIdManager {
 			table_manager.size_tier = table_ix as u8;
 		}
 	}
+	// TODO unused?? (handle does it)
 	fn release(&mut self, handle_id: HandleId) {
 		let mut lock = self.locked.0.lock();
 		if lock.release(handle_id) {
@@ -728,7 +737,7 @@ mod tests {
 	fn wait_log() {
 		use std::{thread, time};
 
-		let sleep = time::Duration::from_millis(100);
+		let sleep = time::Duration::from_millis(500);
 		thread::sleep(sleep);
 	}
 	
@@ -742,13 +751,96 @@ mod tests {
 		commit_with_handle(&db, handle, &mut writer);
 
 		check_state(&db, &state);
-
 		wait_log();
-		
+		check_state(&db, &state);
+
+		let handle = prepare_add(&db, None, &mut state, &mut writer, (6, 10));
+		let handle = prepare_remove(&db, Some(handle), &mut state, &mut writer, (4, 7));
+
+		commit_with_handle(&db, handle, &mut writer);
+
+		check_state(&db, &state);
+		wait_log();
+		check_state(&db, &state);
+
+		let handle = prepare_add(&db, None, &mut state, &mut writer, (11, 12));
+
+		commit_with_handle(&db, handle, &mut writer);
+
+		check_state(&db, &state);
+		wait_log();
 		check_state(&db, &state);
 	}
 
 	#[test]
-	fn test_with_locks() {
+	fn test_no_locks_2() {
+		let options = options("test_no_lock_2");
+		let db = crate::Db::open(&options).unwrap();
+		let mut state = BTreeMap::<u8, (u64, Option<Vec<u8>>)>::new();
+		let mut dropped_state = BTreeMap::<u8, (u64, Option<Vec<u8>>)>::new();
+		let mut writer = BTreeMap::<u64, Option<Vec<u8>>>::new();
+		let handle_1 = prepare_add(&db, None, &mut dropped_state, &mut writer, (50, 55));
+		writer.clear();
+		let handle_2 = prepare_add(&db, None, &mut state, &mut writer, (0, 5));
+		std::mem::drop(handle_1);
+		commit_with_handle(&db, handle_2, &mut writer);
+
+		check_state(&db, &state);
+
+		wait_log();
+		
+		check_state(&db, &state);
+
+		let handle = prepare_add(&db, None, &mut state, &mut writer, (6, 10));
+		let handle = prepare_remove(&db, Some(handle), &mut state, &mut writer, (4, 7));
+
+		commit_with_handle(&db, handle, &mut writer);
+
+		check_state(&db, &state);
+		wait_log();
+		check_state(&db, &state);
+
+		let handle = prepare_add(&db, None, &mut state, &mut writer, (11, 12));
+
+		commit_with_handle(&db, handle, &mut writer);
+
+		check_state(&db, &state);
+		wait_log();
+		check_state(&db, &state);
+
+		let free_list = db.clone_table_id_manager(0, 0).unwrap();
+		panic!("{:?}", free_list);
+	}
+
+	#[test]
+	fn test_locks() {
+		use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+		let mut progress = 0;
+		let options = options("test_locks");
+		let db = crate::Db::open(&options).unwrap();
+		// read lock
+		let mut handle_read = db.get_read_only_handle(0, true).unwrap();
+		handle_read.ready();
+		let mut handle_read_2 = db.get_read_only_handle(0, true).unwrap();
+		handle_read_2.ready();
+		let mut handle_write = db.get_handle(0, true).unwrap();
+		let join = Arc::new(AtomicBool::new(false));
+		let join2 = join.clone();
+		let write_ready = std::thread::spawn(move || {
+			handle_write.ready();
+			join2.store(true, Ordering::Relaxed);
+		});
+		if !join.as_ref().load(Ordering::Relaxed) {
+			std::mem::drop(handle_read);
+			wait_log();
+			progress +=1;
+		}
+		if !join.load(Ordering::Relaxed) {
+			std::mem::drop(handle_read_2);
+			progress +=1;
+		}
+		wait_log();
+		assert!(join.load(Ordering::Relaxed));
+		assert_eq!(progress, 2);
 	}
 }
