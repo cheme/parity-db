@@ -344,13 +344,15 @@ impl Column {
 			let tier = address.size_tier();
 			if let Some(next_free) = next_free {
 				let next_free = Address::from_u64(*next_free);
-				debug_assert!(next_free.size_tier() == tier);
+				debug_assert!(value.is_none() || next_free.size_tier() == tier);
 				// overwrite a value of free_list
 				log::trace!(target: "parity-db", "{}: NoIndexing remove from free list {}", tables.index.id, hex(key));
 				if value.is_some() {
 					tables.value[tier as usize].write_inner_free_list_remove(address.offset(), next_free.offset(), log)?;
 				} else {
-				//	tables.value[tier as usize].write_inner_free_list_remove_over_filled(address.offset(), log, true)?;
+					// extend fill
+					tables.value[tier as usize].write_inner_free_list_remove_over_filled(address.offset(), log, true)?;
+					return Ok(PlanOutcome::Skipped);
 				}
 				no_indexing_new = true;
 			}

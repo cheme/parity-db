@@ -622,6 +622,16 @@ impl TableIdManager {
 		self.filled += 1;
 		self.filled - 1
 	}
+
+	pub(crate) fn need_fill(&self, _handle_id: HandleId) -> Option<u64> {
+		// TODO could also only return if dirty (last_need_filled:
+		// need fill is guaranted to be committed)
+		if self.free_list.len() > 1 {
+			Some(self.filled - 1)
+		} else {
+			None
+		}
+	}
 }
 
 type FetchedIds = Vec<usize>;
@@ -683,6 +693,16 @@ impl IdManager {
 			Address::from_u64(0)
 		}
 	}
+
+	// TODO consider returning address (see use of fn).
+	pub(crate) fn need_fill(&self, col: ColId, size_tier: u8, handle_id: HandleId) -> Option<u64> {
+		if let Some(Some(column)) = self.columns.get(col as usize) {
+			if let Some(table) = column.tables.get(size_tier as usize) {
+				return table.need_fill(handle_id);
+			}
+		}
+		None
+	}
 }
 
 #[cfg(test)]
@@ -703,6 +723,7 @@ mod tests {
 
 		let mut col_option = ColumnOptions::default();
 		col_option.no_indexing = true;
+		// TODO change to have default value in size tier 1 instead of 0
 		Options {
 			path,
 			columns: vec![col_option],
@@ -853,6 +874,34 @@ mod tests {
 		check_state(&db, &state);
 
 		let _ = db.clone_check_table_id_manager(0, 0, true).unwrap();
+	}
+
+	#[test]
+	fn test_no_locks_3() {
+		let options = options("test_no_lock_3");
+		let db = crate::Db::open(&options).unwrap();
+		let mut state = BTreeMap::<u8, (u64, Option<Vec<u8>>)>::new();
+		let mut state_2 = BTreeMap::<u8, (u64, Option<Vec<u8>>)>::new();
+		let mut writer = BTreeMap::<u64, Option<Vec<u8>>>::new();
+		let mut writer_2 = BTreeMap::<u64, Option<Vec<u8>>>::new();
+		let handle_1 = prepare_add(&db, None, &mut state, &mut writer, (50, 55));
+		let handle_2 = prepare_add(&db, None, &mut state_2, &mut writer_2, (0, 5));
+		commit_with_handle(&db, handle_1, &mut writer);
+		writer.clear();
+
+		check_state(&db, &state); // TODO fail: need to preallocate for filled.
+
+		wait_log();
+
+		check_state(&db, &state);
+
+		let _ = db.clone_check_table_id_manager(0, 0, true).unwrap();
+/*
+		unimplemented!("TODO delete over handle_1, then use handle1 to write -> will probably need pre allocate of filled");
+		commit_with_handle(&db, handle_2, &mut writer_2);
+		check_state(&db, &state); // TODO fail: need to preallocate for filled.
+		check_state(&db, &state_2); // TODO fail: need to preallocate for filled.
+*/
 	}
 
 	#[test]

@@ -224,7 +224,6 @@ impl DbInner {
 			I: IntoIterator<Item=(ColId, K, Option<Value>)>,
 			K: AsRef<[u8]>,
 	{
-	
 		{
 			let bg_err = self.bg_err.lock();
 			if let Some(err) = &*bg_err {
@@ -235,7 +234,7 @@ impl DbInner {
 		let mut non_canonical_overlay = self.free_table_id_manager.write();
 		// TODO since we collect here: there is surely a way to group by col and key and have a
 		// more efficient non_canonical resolution (currently it looks up each keys).
-		let commit: Vec<_> = tx.into_iter().map(|(c, k, v)| {
+		let mut commit: Vec<_> = tx.into_iter().map(|(c, k, v)| {
 			if let Some(handle) = non_canonical.get(&c) {
 				if v.is_some() {
 					let k = non_canonical_overlay.commit_entry(c, k, handle.id);
@@ -252,6 +251,22 @@ impl DbInner {
 				(c, self.columns[c as usize].hash(k.as_ref()), v)
 			}
 		}).collect();
+		let mut fill_commits = Vec::new();
+		for (col, handle) in non_canonical.iter() {
+			for size_tier in 0 .. crate::table::SIZE_TIERS as u8 {
+				if let Some(fill) = non_canonical_overlay.need_fill(*col, size_tier, handle.id) {
+					let mut buf = [0u8; 16];
+					let fill = crate::index::Address::new(fill, size_tier);
+					buf[0 .. 8].copy_from_slice(&fill.as_u64().to_be_bytes()[..]);
+					// next is not read.
+					fill_commits.push((*col, self.columns[*col as usize].hash(&buf[..]), None));
+				}
+			}
+/*			if let Some(fill) = non_canonical_overlay.need_fill(col, handle) {
+ *			let mut buf = [0u8; 16];
+				commit.push((col, self.columns[col as usize].hash(&buf[..]), None));
+			}*/
+		}
 		std::mem::drop(non_canonical_overlay);
 
 		{
@@ -275,6 +290,7 @@ impl DbInner {
 				}
 			}
 
+			commit.append(&mut fill_commits);
 			let commit = Commit {
 				id: record_id,
 				changeset: commit,
@@ -292,7 +308,7 @@ impl DbInner {
 			self.signal_log_worker();
 		}
 
-		std::mem::drop(non_canonical);
+		std::mem::drop(non_canonical); // TODO move up
 		self.free_table_id_manager.write().commit();
 		Ok(())
 	}
