@@ -780,7 +780,7 @@ mod tests {
 	}
 	
 	#[test]
-	fn test_no_locks() {
+	fn test_no_locks_1() {
 		let options = options("test_no_lock");
 		let db = crate::Db::open(&options).unwrap();
 		let mut state = BTreeMap::<u8, (u64, Option<Vec<u8>>)>::new();
@@ -792,6 +792,8 @@ mod tests {
 		wait_log();
 		check_state(&db, &state);
 
+		let _ = db.clone_check_table_id_manager(0, 0, true).unwrap();
+
 		let handle = prepare_add(&db, None, &mut state, &mut writer, (6, 10));
 		let handle = prepare_remove(&db, Some(handle), &mut state, &mut writer, (4, 7));
 
@@ -801,6 +803,13 @@ mod tests {
 		wait_log();
 		check_state(&db, &state);
 
+		wait_log();
+		wait_log();
+		wait_log();
+		let _ = db.clone_check_table_id_manager(0, 0, true).unwrap();
+		panic!("{:?}", db.clone_check_table_id_manager(0, 0, false).unwrap());
+		let _ = db.clone_check_table_id_manager(0, 0, true).unwrap();
+
 		let handle = prepare_add(&db, None, &mut state, &mut writer, (11, 12));
 
 		commit_with_handle(&db, handle, &mut writer);
@@ -808,6 +817,8 @@ mod tests {
 		check_state(&db, &state);
 		wait_log();
 		check_state(&db, &state);
+
+		let _ = db.clone_check_table_id_manager(0, 0, true).unwrap();
 	}
 
 	#[test]
@@ -841,7 +852,6 @@ mod tests {
 		wait_log();
 		check_state(&db, &state);
 
-		for i in 0..3 { wait_log() };
 		let _ = db.clone_check_table_id_manager(0, 0, true).unwrap();
 
 		let handle = prepare_add(&db, None, &mut state, &mut writer, (11, 13));
@@ -852,9 +862,7 @@ mod tests {
 		wait_log();
 		check_state(&db, &state);
 
-		for i in 0..3 { wait_log() };
-		let free_list = db.clone_check_table_id_manager(0, 0, true).unwrap();
-		println!("{:?}", free_list);
+		let _ = db.clone_check_table_id_manager(0, 0, true).unwrap();
 	}
 
 	#[test]

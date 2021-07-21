@@ -875,11 +875,16 @@ impl ValueTable {
 		return Ok(true);
 	}
 
-	pub fn write_inner_free_list_remove(&self, index: u64, prev: u64, log: &mut LogWriter) -> Result<()> {
+	pub fn write_inner_free_list_remove_over_filled(&self, index: u64, log: &mut LogWriter, with_index: bool) -> Result<bool> {
 		let filled = self.filled.load(Ordering::Relaxed);
 		if index >= filled {
 			let mut l = self.last_removed.load(Ordering::Relaxed);
-			for i in filled..index {
+			let end = if with_index {
+				index + 1
+			} else {
+				index
+			};
+			for i in filled..end {
 				let mut buf = PartialEntry::new();
 				buf.write_tombstone();
 				buf.write_next(l);
@@ -889,6 +894,14 @@ impl ValueTable {
 			self.filled.store(index + 1, Ordering::Relaxed);
 			self.last_removed.store(l, Ordering::Relaxed);
 			self.dirty_header.store(true, Ordering::Relaxed);
+			Ok(true)
+		} else {
+			Ok(false)
+		}
+	}
+
+	pub fn write_inner_free_list_remove(&self, index: u64, prev: u64, log: &mut LogWriter) -> Result<()> {
+		if self.write_inner_free_list_remove_over_filled(index, log, false)? {
 			return Ok(())
 		}
 		let next = self.read_next_free(index, log)?;
@@ -1020,8 +1033,8 @@ impl ValueTable {
 
 	#[cfg(test)]
 	pub(crate) fn check_free_list(&self, ids: &crate::no_indexing::TableIdManager, log: &impl LogQuery) -> bool {
-		let filled = self.filled.load(std::sync::atomic::Ordering::Relaxed);
-		let last = self.last_removed.load(std::sync::atomic::Ordering::Relaxed); // TODO from db
+		let filled_a = self.filled.load(std::sync::atomic::Ordering::Relaxed);
+		let last_a = self.last_removed.load(std::sync::atomic::Ordering::Relaxed); // TODO from db
 		let mut header = Header::default();
 		if log.value(self.id, 0, &mut header.0) {
 		} else {

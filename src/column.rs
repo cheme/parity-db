@@ -349,6 +349,8 @@ impl Column {
 				log::trace!(target: "parity-db", "{}: NoIndexing remove from free list {}", tables.index.id, hex(key));
 				if value.is_some() {
 					tables.value[tier as usize].write_inner_free_list_remove(address.offset(), next_free.offset(), log)?;
+				} else {
+				//	tables.value[tier as usize].write_inner_free_list_remove_over_filled(address.offset(), log, true)?;
 				}
 				no_indexing_new = true;
 			}
