@@ -740,6 +740,10 @@ impl ValueTable {
 
 	fn clear_slot(&self, index: u64, log: &mut LogWriter, no_indexing_new: bool) -> Result<()> {
 		if self.no_indexing {
+			if index == 0 {
+				// convention skip for remove on empty
+				return Ok(());
+			}
 			if no_indexing_new {
 				// check if previously added, otherwhise just noop.
 				let mut buf = PartialEntry::new();
